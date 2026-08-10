@@ -8,9 +8,14 @@
 //! `zwlr_virtual_pointer_v1`. Until identified per-toplevel capture is broadly
 //! available, window-scoped screenshots use output crops only for visible,
 //! compositor-attested surfaces and return a typed identity error otherwise.
+//! Hyprland uses its compositor-owned `hyprland-toplevel-export-v1` protocol
+//! for identified per-window capture; unresolved Hyprland identities fail
+//! closed rather than presenting an output crop as that window's pixels.
 
 pub mod ext_screencopy;
 pub mod ext_toplevel;
+pub mod hyprland;
+pub mod hyprland_capture;
 pub mod overlay;
 pub mod persistent_vptr;
 pub(crate) mod portal;
@@ -909,7 +914,16 @@ pub(crate) unsafe fn borrowed_fd(fd: i32) -> std::os::fd::OwnedFd {
 #[derive(Debug)]
 pub struct SurfaceIdentityUnproven {
     window_id: u64,
-    reason: &'static str,
+    reason: String,
+}
+
+impl SurfaceIdentityUnproven {
+    fn new(window_id: u64, reason: impl Into<String>) -> Self {
+        Self {
+            window_id,
+            reason: reason.into(),
+        }
+    }
 }
 
 impl std::fmt::Display for SurfaceIdentityUnproven {
@@ -936,8 +950,8 @@ struct WaylandWindowCrop {
     height: u32,
 }
 
-fn surface_identity_unproven(window_id: u64, reason: &'static str) -> anyhow::Error {
-    SurfaceIdentityUnproven { window_id, reason }.into()
+fn surface_identity_unproven(window_id: u64, reason: impl Into<String>) -> anyhow::Error {
+    SurfaceIdentityUnproven::new(window_id, reason).into()
 }
 
 fn attested_wayland_crop(
@@ -1023,18 +1037,58 @@ fn screenshot_window_bytes_with_dispatch(
     x11_capture(xid)
 }
 
-/// Window capture dispatcher. X11 uses its per-window capture path. Wayland
-/// crops output pixels only when compositor metadata proves that the requested
-/// surface is currently rendered; otherwise it fails closed. Output-level
-/// capture remains available through [`screenshot_display_dispatch`].
-pub fn screenshot_dispatch(xid: u64) -> anyhow::Result<Vec<u8>> {
+fn capture_hyprland_toplevel_bounded(address: u64) -> anyhow::Result<Vec<u8>> {
+    let (sender, receiver) = std::sync::mpsc::sync_channel(1);
+    std::thread::Builder::new()
+        .name("hyprland-toplevel-capture".to_owned())
+        .spawn(move || {
+            let _ = sender.send(hyprland_capture::capture_toplevel_png(address));
+        })?;
+    receiver
+        .recv_timeout(std::time::Duration::from_secs(6))
+        .map_err(|_| anyhow::anyhow!("Hyprland toplevel-export capture timed out"))?
+}
+
+fn screenshot_dispatch_for_target(xid: u64, target_pid: Option<u32>) -> anyhow::Result<Vec<u8>> {
+    if !is_wayland() {
+        return crate::capture::screenshot_window_bytes(xid);
+    }
+
+    if hyprland::is_session() {
+        let identity = identity_for(xid).ok_or_else(|| {
+            SurfaceIdentityUnproven::new(xid, "no Wayland title/app-id identity was cached")
+        })?;
+        let address =
+            hyprland::resolve_capture_address(xid, target_pid, &identity.title, &identity.app_id)
+                .map_err(|error| SurfaceIdentityUnproven::new(xid, error.to_string()))?;
+        return capture_hyprland_toplevel_bounded(address).map_err(|error| {
+            SurfaceIdentityUnproven::new(
+                xid,
+                format!("Hyprland toplevel-export capture failed: {error:#}"),
+            )
+            .into()
+        });
+    }
+
+    // Keep v0.22's shared contract for every other compositor: output pixels
+    // are cropped only from compositor-attested, currently visible geometry.
     screenshot_window_bytes_with_dispatch(
-        is_wayland(),
+        true,
         xid,
         wayland_window_crop,
         screenshot_display_dispatch,
         crate::capture::screenshot_window_bytes,
     )
+}
+
+/// Window capture dispatcher for callers that do not carry process identity.
+pub fn screenshot_dispatch(xid: u64) -> anyhow::Result<Vec<u8>> {
+    screenshot_dispatch_for_target(xid, None)
+}
+
+/// Window capture dispatcher with the PID proven by the public tool target.
+pub fn screenshot_dispatch_with_pid(xid: u64, pid: u32) -> anyhow::Result<Vec<u8>> {
+    screenshot_dispatch_for_target(xid, Some(pid))
 }
 
 fn crop_png_to_rect(
@@ -1135,13 +1189,7 @@ fn checked_shell_helper_capture(
 /// point for callers outside `get_window_state`; it shares the same fail-closed
 /// Wayland contract as [`screenshot_dispatch`].
 pub fn screenshot_window_dispatch(xid: u64) -> anyhow::Result<Vec<u8>> {
-    screenshot_window_bytes_with_dispatch(
-        is_wayland(),
-        xid,
-        wayland_window_crop,
-        screenshot_display_dispatch,
-        crate::capture::screenshot_window_bytes,
-    )
+    screenshot_dispatch(xid)
 }
 
 // ── Input session helper ─────────────────────────────────────────────────────
