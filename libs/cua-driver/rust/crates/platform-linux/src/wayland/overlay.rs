@@ -757,7 +757,7 @@ fn tick_all_cores(cores: &mut HashMap<CursorKey, RenderStateCore>, dt: f64) {
 }
 
 fn needs_frame_tick(core: &RenderStateCore) -> bool {
-    if !core.visible || core.pos.0 < -100.0 {
+    if !core.cursor_is_revealed() {
         return false;
     }
     let fade_start = core.motion.idle_hide_ms / 1000.0;
@@ -772,7 +772,7 @@ fn needs_frame_tick(core: &RenderStateCore) -> bool {
 
 fn idle_fade_wait(core: &RenderStateCore) -> Option<Duration> {
     if !core.visible
-        || core.pos.0 < -100.0
+        || core.pos.is_none()
         || core.motion.idle_hide_ms <= 0.0
         || core.path.is_some()
         || core.spring.is_some()
@@ -804,7 +804,7 @@ fn quiesce_hidden(core: &mut RenderStateCore) {
 ///    in `ext_screencopy::encode_buffer_to_png`.
 /// 4. Attach + damage + commit on the layer surface.
 ///
-/// Hidden, idle-faded, or off-screen cores paint nothing.
+/// Hidden, idle-faded, or unplaced cores paint nothing.
 fn redraw(
     state: &mut OverlayState,
     shm: &WlShm,
@@ -1290,7 +1290,7 @@ mod tests {
 
     fn positioned_core() -> RenderStateCore {
         let mut core = RenderStateCore::new(CursorConfig::default());
-        core.pos = (100.0, 100.0);
+        core.pos = Some((100.0, 100.0));
         core.motion.idle_hide_ms = 1_000.0;
         core
     }
@@ -1377,7 +1377,7 @@ mod tests {
             },
         ];
         let mut core = positioned_core();
-        core.pos = (400.0, 300.0);
+        core.pos = Some((400.0, 300.0));
         let cores = HashMap::from([("session".to_owned(), core)]);
 
         assert_eq!(select_output(&layouts, 400.0, 300.0).unwrap().id, 4);
