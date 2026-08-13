@@ -1372,8 +1372,15 @@ impl VptrSession {
         if hyprland::is_session() {
             // Hyprland has known multi-output normalization defects for
             // virtual-pointer absolute motion. Its compositor dispatcher uses
-            // the exact same global logical coordinates as client geometry;
-            // keep virtual-pointer for the subsequent button/axis event only.
+            // the exact same global logical coordinates as client geometry.
+            // Still update the virtual device before its button/axis event:
+            // moving only the seat cursor leaves the virtual pointer at its
+            // previous location, so its press can target a different surface
+            // than the cursor shown to the user.
+            self.vptr
+                .motion_absolute(event_time_ms(), px, py, self.output_w, self.output_h);
+            self.vptr.frame();
+            self.queue.roundtrip(&mut self.state)?;
             hyprland::move_cursor(global_x, global_y)?;
         } else {
             self.vptr
