@@ -346,8 +346,8 @@ fn apply_keyed_command(
     let core = cores
         .entry(key.clone())
         .or_insert_with(|| render_core_for_key(template, &key));
-    // Seed from the off-screen sentinel near the first targeted action so a
-    // spring animation begins on-screen. This mirrors the X11 renderer.
+    // Seed an unplaced cursor near the first targeted action so a spring
+    // animation begins on-screen. This mirrors the X11 renderer.
     let seed_target = match &cmd {
         OverlayCommand::MoveTo { x, y, .. }
         | OverlayCommand::SnapTo { x, y, .. }
@@ -355,17 +355,17 @@ fn apply_keyed_command(
         _ => None,
     };
     if let Some((target_x, target_y)) = seed_target {
-        if core.pos.0 < -50.0 {
+        if core.pos.is_none() {
             const SEED_OFFSET: f64 = 16.0;
-            core.pos = (
+            core.pos = Some((
                 (target_x - SEED_OFFSET).max(2.0),
                 (target_y - SEED_OFFSET).max(2.0),
-            );
+            ));
         }
     }
 
     let disabling = matches!(&cmd, OverlayCommand::SetEnabled(false));
-    let dirty = core.apply_command_base(cmd, false, false);
+    let dirty = core.apply_command_base(cmd, true);
     if disabling {
         quiesce_hidden(core);
     }
@@ -458,10 +458,10 @@ fn visible_cores_for_output<'a>(
         .iter()
         .filter(|(_, core)| {
             core.visible
-                && core.pos.0 >= -100.0
                 && core.idle_alpha >= 0.004
-                && select_output(layouts, core.pos.0, core.pos.1)
-                    .is_some_and(|selected| selected.id == output_id)
+                && core.pos.is_some_and(|(x, y)| {
+                    select_output(layouts, x, y).is_some_and(|selected| selected.id == output_id)
+                })
         })
         .collect();
     visible_cores.sort_by(|(left, _), (right, _)| left.cmp(right));
@@ -757,7 +757,7 @@ fn tick_all_cores(cores: &mut HashMap<CursorKey, RenderStateCore>, dt: f64) {
 }
 
 fn needs_frame_tick(core: &RenderStateCore) -> bool {
-    if !core.visible || core.pos.0 < -100.0 {
+    if !core.cursor_is_revealed() {
         return false;
     }
     let fade_start = core.motion.idle_hide_ms / 1000.0;
@@ -772,7 +772,7 @@ fn needs_frame_tick(core: &RenderStateCore) -> bool {
 
 fn idle_fade_wait(core: &RenderStateCore) -> Option<Duration> {
     if !core.visible
-        || core.pos.0 < -100.0
+        || core.pos.is_none()
         || core.motion.idle_hide_ms <= 0.0
         || core.path.is_some()
         || core.spring.is_some()
@@ -804,7 +804,7 @@ fn quiesce_hidden(core: &mut RenderStateCore) {
 ///    in `ext_screencopy::encode_buffer_to_png`.
 /// 4. Attach + damage + commit on the layer surface.
 ///
-/// Hidden, idle-faded, or off-screen cores paint nothing.
+/// Hidden, idle-faded, or unplaced cores paint nothing.
 fn redraw(
     state: &mut OverlayState,
     shm: &WlShm,
@@ -818,8 +818,8 @@ fn redraw(
     let cursor_positions = state
         .cores
         .values()
-        .filter(|core| core.visible && core.pos.0 >= -100.0 && core.idle_alpha >= 0.004)
-        .map(|core| core.pos);
+        .filter(|core| core.visible && core.idle_alpha >= 0.004)
+        .filter_map(|core| core.pos);
     let (selected, targets) = frame_plan(
         &layouts,
         &state.painted_outputs,
@@ -898,7 +898,9 @@ fn redraw_output(
                 None,
                 1.0,
             );
-            painted_positions.push(core.pos);
+            if let Some(position) = core.pos {
+                painted_positions.push(position);
+            }
         }
     }
 
@@ -1290,7 +1292,7 @@ mod tests {
 
     fn positioned_core() -> RenderStateCore {
         let mut core = RenderStateCore::new(CursorConfig::default());
-        core.pos = (100.0, 100.0);
+        core.pos = Some((100.0, 100.0));
         core.motion.idle_hide_ms = 1_000.0;
         core
     }
@@ -1377,7 +1379,7 @@ mod tests {
             },
         ];
         let mut core = positioned_core();
-        core.pos = (400.0, 300.0);
+        core.pos = Some((400.0, 300.0));
         let cores = HashMap::from([("session".to_owned(), core)]);
 
         assert_eq!(select_output(&layouts, 400.0, 300.0).unwrap().id, 4);
@@ -1618,7 +1620,7 @@ mod tests {
             &layouts,
             &HashSet::new(),
             &initialized(&layouts),
-            cores.values().map(|core| core.pos),
+            cores.values().filter_map(|core| core.pos),
         );
         assert_eq!(painted, HashSet::from([1, 2]));
         assert_eq!(targets, vec![FrameTarget { id: 1 }, FrameTarget { id: 2 }]);
@@ -1642,7 +1644,7 @@ mod tests {
             &layouts,
             &painted,
             &initialized(&layouts),
-            cores.values().map(|core| core.pos),
+            cores.values().filter_map(|core| core.pos),
         );
         assert_eq!(selected, HashSet::from([2]));
         assert_eq!(targets, vec![FrameTarget { id: 1 }, FrameTarget { id: 2 }]);
