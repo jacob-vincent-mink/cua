@@ -7467,7 +7467,7 @@ impl Tool for KillAppTool {
             .and_then(Value::as_i64)
             .filter(|pid| *pid > 0)
             .ok_or_else(|| "kill_app requires a positive integer pid".to_owned())?;
-        let fingerprint = crate::browser_platform::LinuxBrowserPlatform
+        let fingerprint = crate::browser_platform::LinuxBrowserPlatform::default()
             .process_fingerprint(pid)
             .await
             .map_err(|error| error.message)?;
@@ -8136,7 +8136,9 @@ pub fn build_registry_with_provider(
         super::page::LinuxPageBackend::new(),
     ))));
     let browser_engine = cua_driver_core::browser::BrowserEngine::new_with_runtime_services(
-        Arc::new(crate::browser_platform::LinuxBrowserPlatform),
+        Arc::new(crate::browser_platform::LinuxBrowserPlatform::new(
+            state.cursor_registry.clone(),
+        )),
         r.approval_broker(),
         r.protected_resource_ownership(),
     );
