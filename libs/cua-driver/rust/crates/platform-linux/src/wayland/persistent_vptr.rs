@@ -23,6 +23,8 @@
 //!   activate — would steal focus mid-drag) and roundtrip.
 //! - `release` emits a button release, removes from the held set; if the
 //!   set is empty the vptr is destroyed and the map entry dropped.
+//! - `release_all` emits releases for every button still held by one cursor;
+//!   session and runtime cleanup use this idempotent path before teardown.
 //! - On `Connection` roundtrip failure (compositor restart / disconnect)
 //!   the owner thread tears down its connection and accepts the next
 //!   command on a fresh one, emitting a typed error for the in-flight call.
@@ -56,6 +58,10 @@ enum Cmd {
     Release {
         cursor_id: String,
         button: u8,
+        reply: Sender<anyhow::Result<()>>,
+    },
+    ReleaseAll {
+        cursor_id: String,
         reply: Sender<anyhow::Result<()>>,
     },
     /// Drop the entry for a cursor_id without sending wire events — used to
@@ -124,10 +130,15 @@ fn owner_thread(rx: Receiver<Cmd>) {
                 let r = handle_release(&mut active, &cursor_id, button);
                 let _ = reply.send(r);
             }
+            Cmd::ReleaseAll { cursor_id, reply } => {
+                let r = handle_release_all(&mut active, &cursor_id);
+                let _ = reply.send(r);
+            }
             Cmd::Forget { cursor_id, reply } => {
                 if let Some(p) = active.remove(&cursor_id) {
                     p.vptr.destroy();
                 }
+                forget_conn(&cursor_id);
                 let _ = reply.send(Ok(()));
             }
         }
@@ -230,6 +241,31 @@ fn handle_release(
     Ok(())
 }
 
+fn handle_release_all(
+    active: &mut HashMap<String, ActivePointer>,
+    cursor_id: &str,
+) -> anyhow::Result<()> {
+    let Some(entry) = active.get_mut(cursor_id) else {
+        // Cleanup is intentionally idempotent: an absent entry means there is
+        // no live virtual-pointer device left that could keep a button held.
+        forget_conn(cursor_id);
+        return Ok(());
+    };
+
+    for button in entry.held.iter().copied() {
+        entry.vptr.button(0, button, ButtonState::Released);
+    }
+    entry.vptr.frame();
+    roundtrip_on_persistent(cursor_id)?;
+
+    if let Some(pointer) = active.remove(cursor_id) {
+        pointer.vptr.destroy();
+        roundtrip_on_persistent(cursor_id).ok();
+    }
+    forget_conn(cursor_id);
+    Ok(())
+}
+
 // Process-static slots for Connection + EventQueue keyed by cursor_id. The
 // EventQueue is !Send but we only touch these on the owner thread, so wrap
 // in a thread-local-by-construction pattern: store inside the same map so
@@ -313,6 +349,20 @@ pub fn release(cursor_id: &str, button: u8) -> anyhow::Result<()> {
     tx().send(Cmd::Release {
         cursor_id: cursor_id.to_string(),
         button,
+        reply: tx_r,
+    })
+    .map_err(|e| anyhow::anyhow!("cua-persistent-vptr thread is dead: {e}"))?;
+    rx_r.recv()
+        .map_err(|e| anyhow::anyhow!("reply channel closed: {e}"))?
+}
+
+/// Release every button still held by `cursor_id`, then destroy its persistent
+/// virtual-pointer. An already-absent cursor succeeds so lifecycle cleanup can
+/// be retried safely after a partial teardown.
+pub fn release_all(cursor_id: &str) -> anyhow::Result<()> {
+    let (tx_r, rx_r) = bounded(1);
+    tx().send(Cmd::ReleaseAll {
+        cursor_id: cursor_id.to_string(),
         reply: tx_r,
     })
     .map_err(|e| anyhow::anyhow!("cua-persistent-vptr thread is dead: {e}"))?;

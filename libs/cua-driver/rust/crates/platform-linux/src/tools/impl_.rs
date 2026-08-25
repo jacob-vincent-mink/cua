@@ -180,6 +180,7 @@ pub struct MouseHoldState {
     pub button: u8,
     pub x: f64,
     pub y: f64,
+    pub wayland: bool,
 }
 
 impl ToolState {
@@ -2041,6 +2042,146 @@ fn mouse_hold_json(cursor_id: &str, hold: Option<&MouseHoldState>) -> Value {
             "y": Value::Null,
         }),
     }
+}
+
+struct MousePressCleanupGuard(Option<Box<dyn FnOnce() + Send>>);
+
+impl MousePressCleanupGuard {
+    fn new(cleanup: impl FnOnce() + Send + 'static) -> Self {
+        Self(Some(Box::new(cleanup)))
+    }
+
+    fn disarm(&mut self) {
+        self.0.take();
+    }
+}
+
+impl Drop for MousePressCleanupGuard {
+    fn drop(&mut self) {
+        if let Some(cleanup) = self.0.take() {
+            cleanup();
+        }
+    }
+}
+
+fn release_mouse_button(cursor_id: &str, hold: &MouseHoldState) -> anyhow::Result<()> {
+    if hold.wayland {
+        crate::wayland::persistent_vptr::release_all(cursor_id)
+    } else {
+        crate::input::send_button_up(hold.xid, hold.x as i32, hold.y as i32, hold.button)
+    }
+}
+
+fn press_mouse_button_with_cleanup(
+    cursor_id: String,
+    hold: MouseHoldState,
+) -> anyhow::Result<MousePressCleanupGuard> {
+    if hold.wayland {
+        crate::wayland::persistent_vptr::press(
+            &cursor_id,
+            hold.xid,
+            hold.x as i32,
+            hold.y as i32,
+            hold.button,
+        )?;
+    } else {
+        crate::input::send_button_down(hold.xid, hold.x as i32, hold.y as i32, hold.button)?;
+    }
+
+    let cleanup_cursor_id = cursor_id;
+    let cleanup_hold = hold;
+    Ok(MousePressCleanupGuard::new(move || {
+        if let Err(error) = release_mouse_button(&cleanup_cursor_id, &cleanup_hold) {
+            tracing::warn!(
+                cursor_id = %cleanup_cursor_id,
+                error = %error,
+                "failed to release a held pointer after mouse_button_down cancellation"
+            );
+            if cleanup_hold.wayland {
+                if let Err(teardown_error) =
+                    crate::wayland::persistent_vptr::forget(&cleanup_cursor_id)
+                {
+                    tracing::warn!(
+                        cursor_id = %cleanup_cursor_id,
+                        error = %teardown_error,
+                        "failed to tear down a cancelled persistent pointer"
+                    );
+                }
+            }
+        }
+    }))
+}
+
+fn release_tracked_mouse_hold_with(
+    mouse_holds: &std::sync::Mutex<std::collections::HashMap<String, MouseHoldState>>,
+    cursor_id: &str,
+    release: impl FnOnce(&MouseHoldState) -> Result<(), String>,
+) -> Result<bool, String> {
+    let Some(hold) = mouse_holds.lock().unwrap().get(cursor_id).cloned() else {
+        return Ok(false);
+    };
+    release(&hold)?;
+    mouse_holds.lock().unwrap().remove(cursor_id);
+    Ok(true)
+}
+
+fn release_tracked_mouse_hold(state: &ToolState, cursor_id: &str) -> Result<bool, String> {
+    release_tracked_mouse_hold_with(&state.mouse_hold, cursor_id, |hold| {
+        release_mouse_button(cursor_id, hold).map_err(|error| error.to_string())
+    })
+}
+
+fn cleanup_linux_pointer_session(state: &ToolState, cursor_id: &str) -> Result<(), String> {
+    if release_tracked_mouse_hold(state, cursor_id)? {
+        crate::overlay::send_command_for(
+            cursor_id.to_owned(),
+            cursor_overlay::OverlayCommand::SetPressed(false),
+        );
+    }
+    state.cursor_registry.remove(cursor_id);
+    crate::overlay::remove_cursor(cursor_id.to_owned());
+    crate::input::forget_master_pointer(cursor_id);
+    Ok(())
+}
+
+fn force_forget_linux_pointer_session(state: &ToolState, cursor_id: &str) {
+    if state
+        .mouse_hold
+        .lock()
+        .unwrap()
+        .get(cursor_id)
+        .is_some_and(|hold| hold.wayland)
+    {
+        let _ = crate::wayland::persistent_vptr::forget(cursor_id);
+    }
+    state.mouse_hold.lock().unwrap().remove(cursor_id);
+    crate::overlay::send_command_for(
+        cursor_id.to_owned(),
+        cursor_overlay::OverlayCommand::SetPressed(false),
+    );
+    state.cursor_registry.remove(cursor_id);
+    crate::overlay::remove_cursor(cursor_id.to_owned());
+    crate::input::forget_master_pointer(cursor_id);
+}
+
+fn runtime_pointer_session_ids(state: &ToolState, prefix: &str) -> Vec<String> {
+    let mut ids = state
+        .cursor_registry
+        .all_states()
+        .into_iter()
+        .map(|cursor| cursor.config.cursor_id)
+        .filter(|cursor_id| cursor_id.starts_with(prefix))
+        .collect::<std::collections::BTreeSet<_>>();
+    ids.extend(
+        state
+            .mouse_hold
+            .lock()
+            .unwrap()
+            .keys()
+            .filter(|cursor_id| cursor_id.starts_with(prefix))
+            .cloned(),
+    );
+    ids.into_iter().collect()
 }
 
 fn held_target_mismatch(
@@ -5759,35 +5900,34 @@ impl Tool for MouseButtonDownTool {
             );
         }
 
-        let xi = x as i32;
-        let yi = y as i32;
         // Native Wayland: route through the persistent virtual-pointer module
         // so the held button survives across tool calls; the X11 path keeps
-        // the existing input::send_button_down behaviour.
-        let result = if crate::wayland::is_wayland() {
-            let cid = cursor_id.clone();
-            tokio::task::spawn_blocking(move || {
-                crate::wayland::persistent_vptr::press(&cid, xid, xi, yi, button)
-            })
-            .await
-        } else {
-            tokio::task::spawn_blocking(move || crate::input::send_button_down(xid, xi, yi, button))
-                .await
+        // the existing input::send_button_down behaviour. The cleanup guard
+        // is created inside the blocking task: if this async invocation is
+        // cancelled before it records the hold below, dropping the abandoned
+        // task result emits the matching release.
+        let hold = MouseHoldState {
+            pid,
+            xid,
+            button,
+            x,
+            y,
+            wayland: crate::wayland::is_wayland(),
         };
+        let press_cursor_id = cursor_id.clone();
+        let press_hold = hold.clone();
+        let result = tokio::task::spawn_blocking(move || {
+            press_mouse_button_with_cleanup(press_cursor_id, press_hold)
+        })
+        .await;
         match result {
-            Ok(Ok(())) => {
-                let hold = MouseHoldState {
-                    pid,
-                    xid,
-                    button,
-                    x,
-                    y,
-                };
+            Ok(Ok(mut cancellation_cleanup)) => {
                 self.state
                     .mouse_hold
                     .lock()
                     .unwrap()
                     .insert(cursor_id.clone(), hold.clone());
+                cancellation_cleanup.disarm();
                 if let Ok(Ok((sx, sy))) =
                     tokio::task::spawn_blocking(move || window_local_to_screen(xid, x, y)).await
                 {
@@ -5924,7 +6064,7 @@ impl Tool for MouseDragTool {
         let mut result: anyhow::Result<()> = Ok(());
         let mut prev_x = from_x;
         let mut prev_y = from_y;
-        let is_wl = crate::wayland::is_wayland();
+        let is_wl = hold.wayland;
         for i in 1..=steps {
             let t = i as f64 / steps as f64;
             let ix = from_x + (to_x - from_x) * t;
@@ -6113,7 +6253,7 @@ impl Tool for MouseButtonUpTool {
         // Native Wayland: release through the persistent virtual-pointer so
         // the same vptr device that emitted the press also emits the release
         // (single logical drag rather than a click pair).
-        let result = if crate::wayland::is_wayland() {
+        let result = if hold.wayland {
             let cid = cursor_id.clone();
             tokio::task::spawn_blocking(move || {
                 crate::wayland::persistent_vptr::release(&cid, button)
@@ -8167,18 +8307,11 @@ pub fn build_registry_with_provider(
         ))
     };
     let session_end_hook = {
-        let cursor_registry = state.cursor_registry.clone();
         let state_for_session_end = state.clone();
-        cua_driver_core::session::register_scoped_session_end_hook(move |session_id| {
-            cursor_registry.remove(session_id);
-            crate::overlay::remove_cursor(session_id.to_owned());
-            state_for_session_end
-                .mouse_hold
-                .lock()
-                .unwrap()
-                .remove(session_id);
-            crate::input::forget_master_pointer(session_id);
-        })
+        cua_driver_core::session::register_scoped_fallible_session_end_hook(
+            "linux_pointer_state",
+            move |session_id| cleanup_linux_pointer_session(&state_for_session_end, session_id),
+        )
     };
     let session_revive_hook =
         cua_driver_core::session::register_scoped_session_revive_hook(move |session_id| {
@@ -8190,15 +8323,17 @@ pub fn build_registry_with_provider(
     r.retain_session_revive_hook(session_revive_hook);
     if let Some(runtime_scope) = cua_driver_core::tool::current_dispatch_runtime_scope() {
         let prefix = format!("__cua_runtime_{runtime_scope}:");
-        let cursor_registry = state.cursor_registry.clone();
+        let state_for_runtime = state.clone();
         r.retain_runtime_cleanup(move || {
-            for cursor in cursor_registry
-                .all_states()
-                .into_iter()
-                .filter(|cursor| cursor.config.cursor_id.starts_with(&prefix))
-            {
-                cursor_registry.remove(&cursor.config.cursor_id);
-                crate::overlay::remove_cursor(cursor.config.cursor_id);
+            for cursor_id in runtime_pointer_session_ids(&state_for_runtime, &prefix) {
+                if let Err(error) = cleanup_linux_pointer_session(&state_for_runtime, &cursor_id) {
+                    tracing::warn!(
+                        cursor_id,
+                        error,
+                        "failed to release held pointer during Linux runtime cleanup; forcing device teardown"
+                    );
+                    force_forget_linux_pointer_session(&state_for_runtime, &cursor_id);
+                }
             }
         });
     }
@@ -8584,5 +8719,103 @@ mod desktop_capture_frame_tests {
         let error = normalize_desktop_capture_for_action_frame(png(3200, 2000), 1600, 1200)
             .expect_err("nonuniform mapping must fail closed");
         assert!(error.to_string().contains("cannot be mapped uniformly"));
+    }
+}
+
+#[cfg(test)]
+mod mouse_hold_cleanup_tests {
+    use super::{
+        release_tracked_mouse_hold_with, runtime_pointer_session_ids, MouseHoldState,
+        MousePressCleanupGuard, ToolState,
+    };
+    use std::collections::HashMap;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Arc, Mutex};
+
+    fn hold(button: u8) -> MouseHoldState {
+        MouseHoldState {
+            pid: 42,
+            xid: 77,
+            button,
+            x: 12.0,
+            y: 34.0,
+            wayland: false,
+        }
+    }
+
+    #[test]
+    fn abandoned_press_result_releases_while_an_adopted_result_disarms() {
+        let releases = Arc::new(AtomicUsize::new(0));
+        let releases_for_abandoned = releases.clone();
+        {
+            let _guard = MousePressCleanupGuard::new(move || {
+                releases_for_abandoned.fetch_add(1, Ordering::SeqCst);
+            });
+        }
+        assert_eq!(releases.load(Ordering::SeqCst), 1);
+
+        let releases_for_adopted = releases.clone();
+        let mut guard = MousePressCleanupGuard::new(move || {
+            releases_for_adopted.fetch_add(1, Ordering::SeqCst);
+        });
+        guard.disarm();
+        drop(guard);
+        assert_eq!(releases.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn successful_cleanup_releases_before_forgetting_the_hold() {
+        let holds = Mutex::new(HashMap::from([("session-a".to_owned(), hold(3))]));
+        let observed = Arc::new(Mutex::new(Vec::new()));
+        let observed_for_release = observed.clone();
+
+        assert_eq!(
+            release_tracked_mouse_hold_with(&holds, "session-a", move |held| {
+                observed_for_release
+                    .lock()
+                    .unwrap()
+                    .push((held.xid, held.button, held.x, held.y));
+                Ok(())
+            }),
+            Ok(true)
+        );
+        assert_eq!(*observed.lock().unwrap(), vec![(77, 3, 12.0, 34.0)]);
+        assert!(holds.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn failed_cleanup_retains_the_hold_for_a_bounded_retry() {
+        let holds = Mutex::new(HashMap::from([("session-a".to_owned(), hold(1))]));
+
+        assert_eq!(
+            release_tracked_mouse_hold_with(&holds, "session-a", |_| {
+                Err("temporary release failure".to_owned())
+            }),
+            Err("temporary release failure".to_owned())
+        );
+        assert_eq!(holds.lock().unwrap()["session-a"].button, 1);
+        assert_eq!(
+            release_tracked_mouse_hold_with(&holds, "session-a", |_| Ok(())),
+            Ok(true)
+        );
+        assert!(holds.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn runtime_cleanup_finds_hold_only_sessions_in_its_own_namespace() {
+        let state = ToolState::new();
+        state.mouse_hold.lock().unwrap().extend([
+            ("__cua_runtime_scope-a:beta".to_owned(), hold(1)),
+            ("__cua_runtime_scope-a:alpha".to_owned(), hold(2)),
+            ("__cua_runtime_scope-b:other".to_owned(), hold(3)),
+        ]);
+
+        assert_eq!(
+            runtime_pointer_session_ids(&state, "__cua_runtime_scope-a:"),
+            vec![
+                "__cua_runtime_scope-a:alpha".to_owned(),
+                "__cua_runtime_scope-a:beta".to_owned(),
+            ]
+        );
     }
 }
