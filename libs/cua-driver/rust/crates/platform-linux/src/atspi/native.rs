@@ -2410,11 +2410,8 @@ pub fn get_element_bounds(pid: u32, idx: usize) -> Result<(i32, i32, u32, u32)> 
             } else {
                 entry_find_window_xid(pid).await.unwrap_or(0)
             };
-            element_bounds_for_visited(&visited, pid, xid)
+            element_bound_for_visited(&visited, pid, xid, idx)
                 .await
-                .into_iter()
-                .find(|(element_index, _, _, _, _)| *element_index == idx)
-                .map(|(_, x, y, width, height)| (x, y, width, height))
                 .ok_or_else(|| anyhow!("element {idx} exposes no usable Component bounds"))
         },
         || {
@@ -2611,7 +2608,9 @@ fn combine_wayland_content_offsets(
 /// Compositor decorations and toolkit document offsets are independent and
 /// therefore additive: choosing one or the other leaves WebKit controls one
 /// title bar away from the pixels shown to the caller.
-async fn web_document_extent_for_visited(visited: &[Visited<'_>]) -> Option<(i32, i32, i32, i32)> {
+async fn web_document_raw_extent_for_visited(
+    visited: &[Visited<'_>],
+) -> Option<(i32, i32, i32, i32)> {
     let document = visited
         .iter()
         .filter(|node| node.has_component)
@@ -2619,13 +2618,18 @@ async fn web_document_extent_for_visited(visited: &[Visited<'_>]) -> Option<(i32
         .min_by_key(|node| node.depth)?;
     let proxies = call(document.acc.proxies()).await?.ok()?;
     let component = call(proxies.component()).await?.ok()?;
-    match call(component.get_extents(CoordType::Window)).await {
-        Some(Ok(extent @ (_, _, width, height))) if width > 0 && height > 0 => Some(extent),
-        _ => None,
-    }
+    call(component.get_extents(CoordType::Window)).await?.ok()
 }
 
-async fn web_document_origin_for_visited(visited: &[Visited<'_>], pid: u32) -> Option<(i32, i32)> {
+fn usable_document_extent(extent: Option<(i32, i32, i32, i32)>) -> Option<(i32, i32, i32, i32)> {
+    extent.filter(|(_, _, width, height)| *width > 0 && *height > 0)
+}
+
+fn web_document_origin_from_extent(
+    visited: &[Visited<'_>],
+    pid: u32,
+    document_extent: Option<(i32, i32, i32, i32)>,
+) -> Option<(i32, i32)> {
     if !crate::wayland::is_wayland() {
         return None;
     }
@@ -2633,38 +2637,22 @@ async fn web_document_origin_for_visited(visited: &[Visited<'_>], pid: u32) -> O
     let compositor = sway_window
         .as_ref()
         .map(|window| (window.content_x, window.content_y));
-    let document = visited
-        .iter()
-        .filter(|node| node.has_component)
-        .filter(|node| is_document_role(&node.role) || node.in_web_doc)
-        .min_by_key(|node| node.depth);
-    let document = if let Some(document) = document {
-        match call(document.acc.proxies()).await {
-            Some(Ok(proxies)) => match call(proxies.component()).await {
-                Some(Ok(component)) => match call(component.get_extents(CoordType::Window)).await {
-                    Some(Ok((x, y, width, height))) if x >= 0 && y >= 0 => {
-                        let inferred_top = match (compositor, sway_window.as_ref()) {
-                            (Some((_, 0)), Some(window))
-                                if width > 0
-                                    && height > 0
-                                    && (i64::from(window.width) - i64::from(width)).abs() <= 4
-                                    && i64::from(window.height) > i64::from(height) =>
-                            {
-                                (i64::from(window.height) - i64::from(height))
-                                    .min(i64::from(i32::MAX)) as i32
-                            }
-                            _ => 0,
-                        };
-                        Some((x, y.max(inferred_top)))
-                    }
-                    _ => None,
-                },
-                _ => None,
-            },
-            _ => None,
+    let document = match document_extent {
+        Some((x, y, width, height)) if x >= 0 && y >= 0 => {
+            let inferred_top = match (compositor, sway_window.as_ref()) {
+                (Some((_, 0)), Some(window))
+                    if width > 0
+                        && height > 0
+                        && (i64::from(window.width) - i64::from(width)).abs() <= 4
+                        && i64::from(window.height) > i64::from(height) =>
+                {
+                    (i64::from(window.height) - i64::from(height)).min(i64::from(i32::MAX)) as i32
+                }
+                _ => 0,
+            };
+            Some((x, y.max(inferred_top)))
         }
-    } else {
-        None
+        _ => None,
     };
     let document_is_separate = visited.iter().any(|node| node.on_web_process_bus);
     let combined = combine_wayland_content_offsets(compositor, document, document_is_separate);
@@ -2672,6 +2660,11 @@ async fn web_document_origin_for_visited(visited: &[Visited<'_>], pid: u32) -> O
         "Wayland web content offset: compositor={compositor:?} document={document:?} separate_process={document_is_separate} combined={combined:?}"
     );
     combined
+}
+
+async fn web_document_origin_for_visited(visited: &[Visited<'_>], pid: u32) -> Option<(i32, i32)> {
+    let extent = web_document_raw_extent_for_visited(visited).await;
+    web_document_origin_from_extent(visited, pid, extent)
 }
 
 fn screen_extent_rebase(
@@ -2767,25 +2760,22 @@ fn rebase_renderer_window_offset(
     offset
 }
 
-/// Screen-coordinate bounds for the exact visited sequence rendered into the
-/// current snapshot. Nodes without a usable Component interface, or whose
-/// extents query fails/times out, are omitted rather than borrowing another
-/// live traversal's ordinal.
-///
-/// GTK4 caveat: GTK4's AT-SPI bridge returns `GetExtents(Screen)` as `(0,0)`
-/// for every element (issue #1564 / the #1739 a11y rework), so a screen query
-/// is useless. Instead we query `CoordType::Window` (which GTK4 *does* report
-/// correctly, per-widget) and add a deterministic screen offset — the X11
-/// window origin plus the GTK4 CSD shadow inset from `_GTK_FRAME_EXTENTS` (see
-/// [`window_to_screen_offset`]). For GTK3/Qt the inset is absent, so the
-/// offset is just the X11 origin and the result matches the old screen path.
-///
-/// Returns `(element_index, x, y, width, height)` tuples.
-async fn element_bounds_for_visited(
+struct BoundsCoordinateContext {
+    coord: CoordType,
+    offset: Option<(i32, i32)>,
+    offset_x: i32,
+    offset_y: i32,
+    wayland_scale: Option<WaylandExtentScale>,
+    web_wayland_scale: Option<WaylandExtentScale>,
+    web_document_origin: Option<(i32, i32)>,
+}
+
+async fn bounds_coordinate_context(
     visited: &[Visited<'_>],
     pid: u32,
     xid: u64,
-) -> Vec<(usize, i32, i32, u32, u32)> {
+    needs_web_context: bool,
+) -> BoundsCoordinateContext {
     // Query WINDOW-relative extents and add a deterministic screen offset
     // (X11 window origin + GTK4 CSD inset). This fixes GTK4 — whose
     // CoordType::Screen reports every element at (0,0) — by using the
@@ -2882,19 +2872,21 @@ async fn element_bounds_for_visited(
     // while the renderer subtree uses device pixels. Compare the document
     // frame independently so web descendants are normalized without scaling
     // already-correct native controls.
+    let document_extent = if needs_web_context {
+        web_document_raw_extent_for_visited(visited).await
+    } else {
+        None
+    };
     let web_wayland_scale = if compositor_geometry.is_some() {
-        wayland_extent_scale(
-            web_document_extent_for_visited(visited).await,
-            compositor_geometry,
-        )
+        wayland_extent_scale(usable_document_extent(document_extent), compositor_geometry)
     } else {
         None
     };
     // Add compositor decorations and the embedded document origin for web
     // descendants only. Electron commonly contributes zero for both; WebKitGTK
     // under Sway needs the sum.
-    let web_document_origin = if offset.is_some() {
-        web_document_origin_for_visited(visited, pid).await
+    let web_document_origin = if offset.is_some() && needs_web_context {
+        web_document_origin_from_extent(visited, pid, document_extent)
     } else {
         None
     };
@@ -2908,7 +2900,97 @@ async fn element_bounds_for_visited(
         dlog!("element bounds: SCREEN coords + X11 frame rebase ({ox},{oy})");
     }
 
-    let action_nodes: Vec<&Visited> = visited.iter().filter(|v| is_indexable(v)).collect();
+    BoundsCoordinateContext {
+        coord,
+        offset,
+        offset_x,
+        offset_y,
+        wayland_scale,
+        web_wayland_scale,
+        web_document_origin,
+    }
+}
+
+fn normalize_element_extent(
+    extent: (i32, i32, i32, i32),
+    in_web_doc: bool,
+    context: &BoundsCoordinateContext,
+) -> Option<(i32, i32, u32, u32)> {
+    let (x, y, width, height) = extent;
+    // Unrealized widgets (e.g. items inside closed menus/popovers) report
+    // GetExtents as the i32::MIN sentinel and/or a degenerate 0x0 / 1x1 size.
+    if x == i32::MIN || y == i32::MIN || x < -16384 || y < -16384 || width <= 1 || height <= 1 {
+        return None;
+    }
+    let document = if in_web_doc {
+        context.web_document_origin.unwrap_or((0, 0))
+    } else {
+        (0, 0)
+    };
+    let scale = if in_web_doc {
+        context.web_wayland_scale.or(context.wayland_scale)
+    } else {
+        context.wayland_scale
+    };
+    Some(match (scale, context.offset) {
+        (Some(scale), Some(offset)) => {
+            scale_wayland_extent(x, y, width, height, document, offset, scale)
+        }
+        _ => (
+            x + context.offset_x + document.0,
+            y + context.offset_y + document.1,
+            width as u32,
+            height as u32,
+        ),
+    })
+}
+
+async fn bound_for_node(
+    node: &Visited<'_>,
+    context: &BoundsCoordinateContext,
+) -> Option<(i32, i32, u32, u32)> {
+    if !node.has_component {
+        return None;
+    }
+    let proxies = call(node.acc.proxies()).await?.ok()?;
+    let component = call(proxies.component()).await?.ok()?;
+    let extent = call(component.get_extents(context.coord)).await?.ok()?;
+    normalize_element_extent(extent, node.in_web_doc, context)
+}
+
+/// Resolve one indexed node's bounds without issuing Component.GetExtents for
+/// every other indexed node. The tree walk is still required to preserve the
+/// public snapshot index; only the requested node plus frame/document context
+/// participates in coordinate normalization.
+async fn element_bound_for_visited(
+    visited: &[Visited<'_>],
+    pid: u32,
+    xid: u64,
+    requested_index: usize,
+) -> Option<(i32, i32, u32, u32)> {
+    let target = visited
+        .iter()
+        .filter(|node| is_indexable(node))
+        .nth(requested_index)?;
+    let context = bounds_coordinate_context(visited, pid, xid, target.in_web_doc).await;
+    bound_for_node(target, &context).await
+}
+
+/// Screen-coordinate bounds for the exact visited sequence rendered into the
+/// current snapshot. Nodes without a usable Component interface, or whose
+/// extents query fails/times out, are omitted rather than borrowing another
+/// live traversal's ordinal. Full snapshots deliberately retain the historical
+/// all-indexed-node behavior; single-element lookups use
+/// [`element_bound_for_visited`] above.
+async fn element_bounds_for_visited(
+    visited: &[Visited<'_>],
+    pid: u32,
+    xid: u64,
+) -> Vec<(usize, i32, i32, u32, u32)> {
+    let action_nodes: Vec<&Visited> = visited.iter().filter(|node| is_indexable(node)).collect();
+    let needs_web_context = action_nodes.iter().any(|node| node.in_web_doc);
+    let context = bounds_coordinate_context(visited, pid, xid, needs_web_context).await;
+
     // Hard wall-clock budget for the whole collection: on pathological
     // trees individual D-Bus calls each burn up to CALL_TIMEOUT (geany's
     // unrealized nodes did exactly that). Return whatever was collected
@@ -2925,49 +3007,7 @@ async fn element_bounds_for_visited(
             );
             break;
         }
-        if !node.has_component {
-            continue;
-        }
-        let proxies = match call(node.acc.proxies()).await {
-            Some(Ok(p)) => p,
-            _ => continue,
-        };
-        let comp = match call(proxies.component()).await {
-            Some(Ok(c)) => c,
-            _ => continue,
-        };
-        if let Some(Ok((x, y, w, h))) = call(comp.get_extents(coord)).await {
-            // Unrealized widgets (e.g. items inside closed menus/popovers)
-            // report GetExtents as the i32::MIN sentinel and/or a degenerate
-            // 0x0 / 1x1 size. Emitting those poisons downstream consumers
-            // (overlay renderers, click targeting), so keep only elements
-            // with plausible on-screen geometry. (Validate the raw extents,
-            // before applying the screen offset, so the sentinel check still
-            // catches unrealized widgets.)
-            if x == i32::MIN || y == i32::MIN || x < -16384 || y < -16384 || w <= 1 || h <= 1 {
-                continue;
-            }
-            let (document_x, document_y) = if node.in_web_doc {
-                web_document_origin.unwrap_or((0, 0))
-            } else {
-                (0, 0)
-            };
-            let node_scale = if node.in_web_doc {
-                web_wayland_scale.or(wayland_scale)
-            } else {
-                wayland_scale
-            };
-            let (screen_x, screen_y, width, height) = match (node_scale, offset) {
-                (Some(scale), Some(offset)) => {
-                    scale_wayland_extent(x, y, w, h, (document_x, document_y), offset, scale)
-                }
-                _ => (
-                    x + offset_x + document_x,
-                    y + offset_y + document_y,
-                    w as u32,
-                    h as u32,
-                ),
-            };
+        if let Some((screen_x, screen_y, width, height)) = bound_for_node(node, &context).await {
             out.push((idx, screen_x, screen_y, width, height));
         }
     }
@@ -3083,11 +3123,11 @@ mod coord_tests {
     use super::{
         activation_index, before_snapshot_deadline, combine_wayland_content_offsets,
         is_activation_action, is_enabled_state, is_indexable_capabilities, is_passive_role,
-        is_web_process_bus, prefer_authoritative_wayland_origin, rebase_renderer_window_offset,
-        scale_wayland_extent, screen_extent_rebase, select_click_target, wayland_extent_scale,
-        ApplicationSelection,
+        is_web_process_bus, normalize_element_extent, prefer_authoritative_wayland_origin,
+        rebase_renderer_window_offset, scale_wayland_extent, screen_extent_rebase,
+        select_click_target, wayland_extent_scale, ApplicationSelection, BoundsCoordinateContext,
     };
-    use atspi::{State, StateSet};
+    use atspi::{CoordType, State, StateSet};
     use std::time::Duration;
 
     #[test]
@@ -3298,6 +3338,31 @@ mod coord_tests {
         assert_eq!(
             rebase_renderer_window_offset((100, 50), Some((0, 29))),
             (100, 50)
+        );
+    }
+
+    #[test]
+    fn single_and_snapshot_bounds_share_the_same_coordinate_normalization() {
+        let context = BoundsCoordinateContext {
+            coord: CoordType::Window,
+            offset: Some((100, 50)),
+            offset_x: 108,
+            offset_y: 79,
+            wayland_scale: None,
+            web_wayland_scale: None,
+            web_document_origin: Some((10, 20)),
+        };
+        assert_eq!(
+            normalize_element_extent((5, 6, 20, 10), false, &context),
+            Some((113, 85, 20, 10))
+        );
+        assert_eq!(
+            normalize_element_extent((5, 6, 20, 10), true, &context),
+            Some((123, 105, 20, 10))
+        );
+        assert_eq!(
+            normalize_element_extent((i32::MIN, 6, 20, 10), false, &context),
+            None
         );
     }
 

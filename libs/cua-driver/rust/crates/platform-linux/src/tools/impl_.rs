@@ -1780,19 +1780,27 @@ fn unavailable_webkit_background(
 }
 
 fn unavailable_webkit_hyprland_pointer(pid: u32) -> Option<ToolResult> {
-    (is_webkitgtk_embedder(pid)
-        && crate::wayland::hyprland::is_session()
-        && !crate::wayland::is_inject_mode())
-    .then(|| {
-        ToolResult::error(
-            "Foreground pointer delivery is unavailable: WebKitGTK ignores Hyprland's virtual-pointer button events. Use an element-addressed left click when possible; right-click, double-click, and drag require a target-local compositor input backend.",
-        )
-        .with_structured(json!({
-            "code": "foreground_unavailable",
-            "reason": "webkitgtk_hyprland_virtual_pointer_buttons",
-            "delivery_mode": "foreground"
-        }))
-    })
+    webkit_hyprland_pointer_must_refuse(
+        is_webkitgtk_embedder(pid),
+        crate::wayland::hyprland::is_session(),
+        crate::wayland::is_inject_mode(),
+    )
+    .then(webkit_hyprland_pointer_refusal)
+}
+
+fn webkit_hyprland_pointer_must_refuse(webkitgtk: bool, hyprland: bool, inject_mode: bool) -> bool {
+    webkitgtk && hyprland && !inject_mode
+}
+
+fn webkit_hyprland_pointer_refusal() -> ToolResult {
+    ToolResult::error(
+        "Foreground pointer delivery is unavailable: WebKitGTK ignores Hyprland's virtual-pointer button events. Use an element-addressed left click when possible; right-click, double-click, and drag require a target-local compositor input backend.",
+    )
+    .with_structured(json!({
+        "code": "foreground_unavailable",
+        "reason": "webkitgtk_hyprland_virtual_pointer_buttons",
+        "delivery_mode": "foreground"
+    }))
 }
 
 fn unavailable_webkit_keyboard_background(
@@ -2950,6 +2958,19 @@ impl Tool for ClickTool {
                         return Ok("wayland_atspi");
                     }
                 }
+                // WebKitGTK ignores Hyprland virtual-pointer button events.
+                // A successful single AT-SPI action returned above; every
+                // remaining foreground pixel shape must refuse rather than
+                // falling through to a no-op route and reporting success.
+                if delivery.is_foreground()
+                    && webkit_hyprland_pointer_must_refuse(
+                        webkitgtk,
+                        crate::wayland::hyprland::is_session(),
+                        crate::wayland::is_inject_mode(),
+                    )
+                {
+                    return Ok("webkit_hyprland_foreground_unavailable");
+                }
                 if crate::wayland::is_inject_mode() {
                     crate::wayland::inject_click(pid, xid, x, y, count as u32, button)?;
                     return Ok("wayland_cua_compositor");
@@ -3033,6 +3054,7 @@ impl Tool for ClickTool {
             "background"
         };
         match result {
+            Ok(Ok("webkit_hyprland_foreground_unavailable")) => webkit_hyprland_pointer_refusal(),
             Ok(Ok("background_unavailable")) => {
                 crate::input::delivery::background_unavailable_error(
                     crate::input::delivery::BackgroundUnavailable::FocusedInputOnly,
@@ -8497,7 +8519,10 @@ pub fn build_registry_with_provider(
 
 #[cfg(test)]
 mod click_button_schema_tests {
-    use super::{chromium_background_must_refuse, maps_indicate_gtk, ClickTool};
+    use super::{
+        chromium_background_must_refuse, maps_indicate_gtk, webkit_hyprland_pointer_must_refuse,
+        ClickTool,
+    };
     use cua_driver_core::tool::Tool;
 
     /// Surface 5: schema must advertise the three canonical button values and
@@ -8540,6 +8565,14 @@ mod click_button_schema_tests {
         assert!(!chromium_background_must_refuse(false, true, true));
         assert!(!chromium_background_must_refuse(true, false, true));
         assert!(!chromium_background_must_refuse(false, false, false));
+    }
+
+    #[test]
+    fn webkit_hyprland_pointer_fallback_refuses_without_target_local_injection() {
+        assert!(webkit_hyprland_pointer_must_refuse(true, true, false));
+        assert!(!webkit_hyprland_pointer_must_refuse(false, true, false));
+        assert!(!webkit_hyprland_pointer_must_refuse(true, false, false));
+        assert!(!webkit_hyprland_pointer_must_refuse(true, true, true));
     }
 
     #[test]

@@ -78,9 +78,43 @@ struct ActivePointer {
     /// evdev codes of buttons currently held down. When this set becomes
     /// empty the vptr is destroyed and the entry dropped from the map.
     held: HashSet<u32>,
-    /// Output extent at session open time — needed for motion_absolute.
+    /// Target origin and output layout captured when the button went down.
+    /// Tool coordinates remain local to this held target for the whole drag.
+    target_x: i32,
+    target_y: i32,
+    out_x: i32,
+    out_y: i32,
     out_w: u32,
     out_h: u32,
+    hyprland: bool,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct TargetPointerPosition {
+    output_x: u32,
+    output_y: u32,
+    global_x: i32,
+    global_y: i32,
+}
+
+fn target_pointer_position(
+    target_origin: (i32, i32),
+    output_layout: (i32, i32, u32, u32),
+    local_x: i32,
+    local_y: i32,
+) -> TargetPointerPosition {
+    let global_x = target_origin.0.saturating_add(local_x);
+    let global_y = target_origin.1.saturating_add(local_y);
+    let output_x = (i64::from(global_x) - i64::from(output_layout.0))
+        .clamp(0, i64::from(output_layout.2.saturating_sub(1))) as u32;
+    let output_y = (i64::from(global_y) - i64::from(output_layout.1))
+        .clamp(0, i64::from(output_layout.3.saturating_sub(1))) as u32;
+    TargetPointerPosition {
+        output_x,
+        output_y,
+        global_x: output_layout.0.saturating_add_unsigned(output_x),
+        global_y: output_layout.1.saturating_add_unsigned(output_y),
+    }
 }
 
 /// Process-global command channel into the owner thread. Lazily started on
@@ -153,19 +187,24 @@ fn handle_press(
     y: i32,
     button: u8,
 ) -> anyhow::Result<()> {
+    let (target_x, target_y, _, _) = super::window_geometry(window_id).ok_or_else(|| {
+        anyhow::anyhow!("no compositor geometry for held Wayland target window_id {window_id}")
+    })?;
     // Open a fresh session for this press — this binds the seat, the foreign-
     // toplevel manager, activates the target window, and creates a new vptr.
     // Keep the (out_w, out_h) but drop the queue + state at end of scope; the
     // vptr itself remains alive (Wayland objects survive their original queue
     // as long as the Connection is alive).
     let mut sess = open_vptr_session(Some(window_id))?;
-    let (w, h) = (sess.output_w, sess.output_h);
-    let px = x.clamp(0, w as i32 - 1) as u32;
-    let py = y.clamp(0, h as i32 - 1) as u32;
+    let (out_x, out_y, w, h) = (sess.output_x, sess.output_y, sess.output_w, sess.output_h);
+    let global_x = target_x.saturating_add(x);
+    let global_y = target_y.saturating_add(y);
     let btn = evdev_pointer_button(button);
 
-    sess.vptr.motion_absolute(0, px, py, w, h);
-    sess.vptr.frame();
+    // Use the one-shot session's positioning path so output-origin
+    // normalization and Hyprland's compositor cursor correction stay exactly
+    // aligned with click/scroll/drag.
+    sess.position_pointer(global_x, global_y)?;
     sess.vptr.button(0, btn, ButtonState::Pressed);
     sess.vptr.frame();
     sess.queue.roundtrip(&mut sess.state)?;
@@ -187,8 +226,13 @@ fn handle_press(
         ActivePointer {
             vptr,
             held,
+            target_x,
+            target_y,
+            out_x,
+            out_y,
             out_w: w,
             out_h: h,
+            hyprland: super::hyprland::is_session(),
         },
     );
     Ok(())
@@ -205,13 +249,20 @@ fn handle_move(
             "no held mouse button for cursor '{cursor_id}'; call mouse_button_down first"
         )
     })?;
-    let px = x.clamp(0, entry.out_w as i32 - 1) as u32;
-    let py = y.clamp(0, entry.out_h as i32 - 1) as u32;
+    let point = target_pointer_position(
+        (entry.target_x, entry.target_y),
+        (entry.out_x, entry.out_y, entry.out_w, entry.out_h),
+        x,
+        y,
+    );
     entry
         .vptr
-        .motion_absolute(0, px, py, entry.out_w, entry.out_h);
+        .motion_absolute(0, point.output_x, point.output_y, entry.out_w, entry.out_h);
     entry.vptr.frame();
     roundtrip_on_persistent(cursor_id)?;
+    if entry.hyprland {
+        super::hyprland::move_cursor(point.global_x, point.global_y)?;
+    }
     Ok(())
 }
 
@@ -307,11 +358,12 @@ fn roundtrip_on_persistent(cursor_id: &str) -> anyhow::Result<()> {
 
 // ── public API ────────────────────────────────────────────────────────────
 
-/// Press and HOLD `button` (evdev code) at output coordinates `(x, y)` on the
-/// toplevel identified by `window_id`. Subsequent `move_to` / `release` calls
-/// targeting the same `cursor_id` reuse the same virtual-pointer device, so
-/// the compositor treats the sequence as one logical drag rather than as
-/// independent clicks. Errors if `cursor_id` already has a held button.
+/// Press and HOLD `button` (evdev code) at window-local coordinates `(x, y)`
+/// on the toplevel identified by `window_id`. Subsequent `move_to` calls use
+/// the same target-local coordinate space, while `release` reuses the same
+/// virtual-pointer device so the compositor treats the sequence as one
+/// logical drag rather than independent clicks. Errors if `cursor_id` already
+/// has a held button.
 pub fn press(cursor_id: &str, window_id: u64, x: i32, y: i32, button: u8) -> anyhow::Result<()> {
     let (tx_r, rx_r) = bounded(1);
     tx().send(Cmd::Press {
@@ -327,8 +379,8 @@ pub fn press(cursor_id: &str, window_id: u64, x: i32, y: i32, button: u8) -> any
         .map_err(|e| anyhow::anyhow!("reply channel closed: {e}"))?
 }
 
-/// Emit motion_absolute on the held cursor's virtual-pointer. Errors if there
-/// is no held button for `cursor_id`.
+/// Move the held cursor to window-local `(x, y)` on its original target.
+/// Errors if there is no held button for `cursor_id`.
 pub fn move_to(cursor_id: &str, x: i32, y: i32) -> anyhow::Result<()> {
     let (tx_r, rx_r) = bounded(1);
     tx().send(Cmd::MoveTo {
@@ -383,4 +435,47 @@ pub fn forget(cursor_id: &str) -> anyhow::Result<()> {
     .map_err(|e| anyhow::anyhow!("cua-persistent-vptr thread is dead: {e}"))?;
     rx_r.recv()
         .map_err(|e| anyhow::anyhow!("reply channel closed: {e}"))?
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{target_pointer_position, TargetPointerPosition};
+
+    #[test]
+    fn target_local_points_include_window_and_negative_output_origins() {
+        assert_eq!(
+            target_pointer_position((-1200, 300), (-1920, -200, 3840, 2160), 200, 50),
+            TargetPointerPosition {
+                output_x: 920,
+                output_y: 550,
+                global_x: -1000,
+                global_y: 350,
+            }
+        );
+    }
+
+    #[test]
+    fn target_relative_motion_preserves_local_delta() {
+        let start = target_pointer_position((800, 450), (384, 288, 4096, 1440), 20, 30);
+        let end = target_pointer_position((800, 450), (384, 288, 4096, 1440), 125, 95);
+        assert_eq!((start.global_x, start.global_y), (820, 480));
+        assert_eq!((end.global_x, end.global_y), (925, 545));
+        assert_eq!(
+            (end.output_x - start.output_x, end.output_y - start.output_y),
+            (105, 65)
+        );
+    }
+
+    #[test]
+    fn target_points_clamp_after_global_to_output_normalization() {
+        assert_eq!(
+            target_pointer_position((5000, -5000), (-100, -50, 200, 100), 50, 50),
+            TargetPointerPosition {
+                output_x: 199,
+                output_y: 0,
+                global_x: 99,
+                global_y: -50,
+            }
+        );
+    }
 }
