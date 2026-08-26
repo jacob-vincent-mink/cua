@@ -51,7 +51,34 @@ const FAKE_TOKEN =
  * with a stub class that resolves init() immediately as authenticated.
  * This avoids the real keycloak-js redirecting to the Keycloak login page.
  */
-export async function mockAuth(page: Page): Promise<void> {
+export interface MockFeatureFlags {
+  admin?: boolean
+  billing?: boolean
+  chat?: boolean
+}
+
+export interface MockAuthOptions {
+  holdConfig?: boolean
+  holdAuth?: boolean
+  initRejects?: boolean
+  refreshFails?: boolean
+}
+
+export interface MockAuthControl {
+  releaseConfig(): void
+  releaseAuth(): Promise<void>
+}
+
+export async function mockAuth(
+  page: Page,
+  flags: MockFeatureFlags = {},
+  options: MockAuthOptions = {},
+): Promise<MockAuthControl> {
+  const config = deferred()
+  if (!options.holdConfig) config.resolve()
+  const holdAuth = options.holdAuth ?? false
+  const initRejects = options.initRejects ?? false
+  const refreshFails = options.refreshFails ?? false
   // Intercept the Vite pre-bundled keycloak-js module. Vite serves
   // node_modules deps from /.vite/deps/ or /node_modules/.vite/deps/.
   // Replace the entire module with a stub Keycloak class.
@@ -59,6 +86,18 @@ export async function mockAuth(page: Page): Promise<void> {
     route.fulfill({
       contentType: "application/javascript",
       body: `
+        const authReady = new Promise(resolve => {
+          window.__MOCK_KEYCLOAK__ = {
+            initOptions: null,
+            loginOptions: null,
+            logoutOptions: null,
+            updateTokenMinValidity: [],
+            clearTokenCalls: 0,
+            releaseAuth: resolve,
+          };
+        });
+        ${holdAuth ? "" : "window.__MOCK_KEYCLOAK__.releaseAuth();"}
+
         class Keycloak {
           constructor() {
             this.token = "${FAKE_TOKEN}";
@@ -76,10 +115,26 @@ export async function mockAuth(page: Page): Promise<void> {
             this.resourceAccess = {};
             this.subject = "test-user-id";
           }
-          async init() { this.authenticated = true; return true; }
-          async updateToken() { return true; }
-          login() {}
-          logout() { window.location.href = "/"; }
+          async init(options) {
+            window.__MOCK_KEYCLOAK__.initOptions = options;
+            await authReady;
+            ${initRejects ? 'throw new Error("rejected callback");' : ""}
+            this.authenticated = true;
+            return true;
+          }
+          async updateToken(minValidity) {
+            window.__MOCK_KEYCLOAK__.updateTokenMinValidity.push(minValidity);
+            ${refreshFails ? 'throw new Error("refresh failed");' : ""}
+            return true;
+          }
+          login(options) {
+            window.__MOCK_KEYCLOAK__.loginOptions = options;
+            return Promise.resolve();
+          }
+          logout(options) {
+            window.__MOCK_KEYCLOAK__.logoutOptions = options;
+            return Promise.resolve();
+          }
           register() {}
           accountManagement() {}
           createLoginUrl() { return "/"; }
@@ -87,7 +142,10 @@ export async function mockAuth(page: Page): Promise<void> {
           createRegisterUrl() { return "/"; }
           createAccountUrl() { return "/"; }
           isTokenExpired() { return false; }
-          clearToken() {}
+          clearToken() {
+            window.__MOCK_KEYCLOAK__.clearTokenCalls += 1;
+            this.authenticated = false;
+          }
           hasRealmRole() { return false; }
           hasResourceRole() { return false; }
           loadUserProfile() { return Promise.resolve({ username: "testuser" }); }
@@ -100,10 +158,33 @@ export async function mockAuth(page: Page): Promise<void> {
     })
   })
 
+  await page.route("**/api/config", async route => {
+    await config.promise
+    await route.fulfill({
+      contentType: "application/json",
+      body: JSON.stringify({
+        admin: flags.admin ?? false,
+        billing: flags.billing ?? false,
+        chat: flags.chat ?? false,
+      }),
+    })
+  })
+
   // Intercept any stray Keycloak endpoint requests
   await page.route("**/realms/cyclops-cs/**", (route) =>
     route.fulfill({ status: 200, contentType: "application/json", body: "{}" }),
   )
+
+  return {
+    releaseConfig: config.resolve,
+    releaseAuth: () =>
+      page.evaluate(() => {
+        const control = (window as unknown as {
+          __MOCK_KEYCLOAK__: { releaseAuth(): void }
+        }).__MOCK_KEYCLOAK__
+        control.releaseAuth()
+      }),
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -497,4 +578,236 @@ export async function mockClaimsApi(page: Page): Promise<void> {
       }
     },
   )
+}
+
+
+// ---------------------------------------------------------------------------
+// Chat API mocking
+// ---------------------------------------------------------------------------
+
+export interface MockChatMessage {
+  id: string
+  role: "user" | "assistant" | "tool"
+  content: string
+  created_at: string
+  tool_call_id?: string
+  tool_calls?: Array<{
+    id: string
+    type: "function"
+    function: { name: string; arguments: string }
+  }>
+}
+
+export interface MockChatConversation {
+  id: string
+  title: string
+  created_at: string
+  updated_at: string
+  messages: MockChatMessage[]
+}
+
+export interface MockChatApiOptions {
+  conversations?: MockChatConversation[]
+  holdList?: boolean
+  holdConversation?: boolean
+  turns?: MockChatTurn[]
+  refreshError?: { afterTurnRequests: number; message: string }
+  holdRefresh?: boolean
+  createError?: { message: string }
+}
+
+export interface MockChatApiControl {
+  authorizationHeaders: string[]
+  createRequests: number
+  turnRequests: Array<{ conversationId: string; messages: Array<Record<string, unknown>> }>
+  releaseList(): void
+  releaseConversation(): void
+  releaseRefresh(): void
+  releaseTurn(): void
+}
+
+export interface MockChatTurn {
+  events?: Array<Record<string, unknown>>
+  error?: { status: number; message: string }
+  hold?: boolean
+}
+
+function deferred(): { promise: Promise<void>; resolve: () => void } {
+  let resolve = () => {}
+  const promise = new Promise<void>(complete => {
+    resolve = complete
+  })
+  return { promise, resolve }
+}
+
+function defaultChatConversations(): MockChatConversation[] {
+  const now = new Date().toISOString()
+  return [
+    {
+      id: "conversation-1",
+      title: "Example browser task",
+      created_at: now,
+      updated_at: now,
+      messages: [
+        {
+          id: "message-1",
+          role: "user",
+          content: "Open the example site.",
+          created_at: now,
+        },
+        {
+          id: "message-2",
+          role: "assistant",
+          content: "The example site is ready.",
+          created_at: now,
+        },
+      ],
+    },
+  ]
+}
+
+export async function mockChatApi(
+  page: Page,
+  options: MockChatApiOptions = {},
+): Promise<MockChatApiControl> {
+  const conversations = options.conversations ?? defaultChatConversations()
+  const authorizationHeaders: string[] = []
+  const createRequests = { count: 0 }
+  const turnRequests: Array<{ conversationId: string; messages: Array<Record<string, unknown>> }> = []
+  const list = deferred()
+  const conversation = deferred()
+  const refresh = deferred()
+  const turnGate = deferred()
+  const turns = [...(options.turns ?? [])]
+  let refreshFailuresRemaining = options.refreshError ? 1 : 0
+  let createFailuresRemaining = options.createError ? 1 : 0
+
+  if (!options.holdList) list.resolve()
+  if (!options.holdConversation) conversation.resolve()
+  if (!options.holdRefresh) refresh.resolve()
+  if (!turns.some(item => item.hold)) turnGate.resolve()
+
+  await page.route("**/api/chat/conversations", async route => {
+    if (route.request().method() === "GET") {
+      authorizationHeaders.push(route.request().headers().authorization ?? "")
+      if (options.refreshError && turnRequests.length >= options.refreshError.afterTurnRequests && refreshFailuresRemaining > 0) {
+        refreshFailuresRemaining -= 1
+        await route.fulfill({ status: 500, contentType: "application/json", body: JSON.stringify({ error: options.refreshError.message }) })
+        return
+      }
+      await list.promise
+      if (options.holdRefresh && turnRequests.length > 0) await refresh.promise
+      await route.fulfill({
+        contentType: "application/json",
+        body: JSON.stringify(
+          conversations.map(({ messages: _messages, ...summary }) => summary),
+        ),
+      })
+      return
+    }
+
+    if (route.request().method() === "POST") {
+      createRequests.count += 1
+      if (createFailuresRemaining > 0) {
+        createFailuresRemaining -= 1
+        await route.fulfill({ status: 500, contentType: "application/json", body: JSON.stringify({ error: options.createError!.message }) })
+        return
+      }
+      const now = new Date().toISOString()
+      const created: MockChatConversation = {
+        id: `conversation-${conversations.length + 1}`,
+        title: "New conversation",
+        created_at: now,
+        updated_at: now,
+        messages: [],
+      }
+      conversations.unshift(created)
+      await route.fulfill({
+        status: 201,
+        contentType: "application/json",
+        body: JSON.stringify(created),
+      })
+      return
+    }
+
+    await route.continue()
+  })
+
+  await page.route("**/api/chat/conversations/*", async route => {
+    if (route.request().method() !== "GET") {
+      await route.continue()
+      return
+    }
+
+    if (options.refreshError && turnRequests.length >= options.refreshError.afterTurnRequests && refreshFailuresRemaining > 0) {
+      refreshFailuresRemaining -= 1
+      await route.fulfill({ status: 500, contentType: "application/json", body: JSON.stringify({ error: options.refreshError.message }) })
+      return
+    }
+    await conversation.promise
+    if (options.holdRefresh && turnRequests.length > 0) await refresh.promise
+    const id = new URL(route.request().url()).pathname.split("/").pop()
+    const selected = conversations.find(item => item.id === id)
+    if (!selected) {
+      await route.fulfill({
+        status: 404,
+        contentType: "application/json",
+        body: JSON.stringify({ error: "conversation not found" }),
+      })
+      return
+    }
+    await route.fulfill({ contentType: "application/json", body: JSON.stringify(selected) })
+  })
+
+  await page.route("**/api/chat/conversations/*/turns", async route => {
+    if (route.request().method() !== "POST") {
+      await route.continue()
+      return
+    }
+
+    const url = new URL(route.request().url())
+    const conversationId = url.pathname.split("/").slice(-2, -1)[0]
+    const body = route.request().postDataJSON() as { messages?: Array<Record<string, unknown>> }
+    turnRequests.push({ conversationId, messages: body.messages ?? [] })
+    const now = new Date().toISOString()
+    const selected = conversations.find(item => item.id === conversationId)
+    if (selected) {
+      for (const message of body.messages ?? []) {
+        selected.messages.push({ id: `message-${selected.messages.length + 1}`, role: message.role as MockChatMessage["role"], content: String(message.content ?? ""), created_at: now, ...(typeof message.tool_call_id === "string" ? { tool_call_id: message.tool_call_id } : {}) })
+      }
+      selected.updated_at = now
+    }
+    const turn = turns.shift()
+    if (!turn) {
+      await route.fulfill({ status: 500, contentType: "application/json", body: JSON.stringify({ error: "No mock turn" }) })
+      return
+    }
+    if (turn.hold) await turnGate.promise
+    if (turn.error) {
+      await route.fulfill({
+        status: turn.error.status,
+        contentType: "application/json",
+        body: JSON.stringify({ error: turn.error.message }),
+      })
+      return
+    }
+    if (selected) {
+      const final = [...(turn.events ?? [])].reverse().find(event => event.type === "assistant")?.message as Record<string, unknown> | undefined
+      if (final) selected.messages.push({ id: `message-${selected.messages.length + 1}`, role: "assistant", content: String(final.content ?? ""), created_at: now, ...(Array.isArray(final.tool_calls) ? { tool_calls: final.tool_calls as MockChatMessage["tool_calls"] } : {}) })
+    }
+    await route.fulfill({
+      contentType: "application/x-ndjson",
+      body: (turn.events ?? []).map(event => JSON.stringify(event) + "\n").join(""),
+    })
+  })
+
+  return {
+    authorizationHeaders,
+    get createRequests() { return createRequests.count },
+    turnRequests,
+    releaseList: list.resolve,
+    releaseConversation: conversation.resolve,
+    releaseRefresh: refresh.resolve,
+    releaseTurn: turnGate.resolve,
+  }
 }

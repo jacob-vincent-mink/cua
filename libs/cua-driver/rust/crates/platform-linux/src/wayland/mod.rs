@@ -5,12 +5,12 @@
 //! staging `ext_foreign_toplevel_list_v1`, captures per-output screenshots via
 //! `zwlr_screencopy_manager_v1` + `wl_shm` (native — `grim` remains a
 //! fallback), and synthesises pointer / scroll / drag input via
-//! `zwlr_virtual_pointer_v1`. Per-window image capture is deferred until
-//! `ext-foreign-toplevel-image-capture-source-v1` lands in
-//! `wayland-protocols-wlr`. Hyprland uses its compositor-owned
-//! `hyprland-toplevel-export-v1` protocol for identified per-window capture;
-//! unresolved Hyprland identities fail closed rather than presenting an output
-//! crop as that window's pixels.
+//! `zwlr_virtual_pointer_v1`. Until identified per-toplevel capture is broadly
+//! available, window-scoped screenshots use output crops only for visible,
+//! compositor-attested surfaces and return a typed identity error otherwise.
+//! Hyprland uses its compositor-owned `hyprland-toplevel-export-v1` protocol
+//! for identified per-window capture; unresolved Hyprland identities fail
+//! closed rather than presenting an output crop as that window's pixels.
 
 pub mod ext_screencopy;
 pub mod ext_toplevel;
@@ -230,6 +230,38 @@ fn identity_registry() -> &'static Mutex<HashMap<u64, ToplevelIdentity>> {
 fn observed_origin_registry() -> &'static Mutex<HashMap<u32, (i32, i32)>> {
     static REGISTRY: OnceLock<Mutex<HashMap<u32, (i32, i32)>>> = OnceLock::new();
     REGISTRY.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn listed_window_registry() -> &'static Mutex<HashMap<(u32, u64), u64>> {
+    static REGISTRY: OnceLock<Mutex<HashMap<(u32, u64), u64>>> = OnceLock::new();
+    REGISTRY.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn remember_listed_windows(windows: &[WindowInfo]) {
+    if let Ok(mut registry) = listed_window_registry().lock() {
+        for window in windows {
+            if let Some((pid, instance_id)) = window.pid.and_then(|pid| {
+                crate::proc_fs::process_instance_id(pid).map(|instance_id| (pid, instance_id))
+            }) {
+                registry.insert((pid, window.xid), instance_id);
+            }
+        }
+    }
+}
+
+pub fn window_was_listed_for_pid(pid: u32, window_id: u64) -> bool {
+    let current_instance = crate::proc_fs::process_instance_id(pid);
+    listed_window_registry()
+        .lock()
+        .ok()
+        .and_then(|registry| registry.get(&(pid, window_id)).copied())
+        == current_instance
+        && current_instance.is_some()
+}
+
+fn listed_windows(windows: Vec<WindowInfo>) -> Vec<WindowInfo> {
+    remember_listed_windows(&windows);
+    windows
 }
 
 pub fn remember_observed_window_origins(windows: &[WindowInfo]) {
@@ -603,6 +635,39 @@ fn unique_hyprland_address(
     }
 }
 
+fn correlate_hyprland_toplevels(
+    toplevels: &HashMap<u32, Toplevel>,
+    windows: &[hyprland::Window],
+) -> HashMap<u32, u64> {
+    let mut used = HashSet::new();
+    let mut open = toplevels
+        .iter()
+        .filter(|(_, toplevel)| !toplevel.closed)
+        .collect::<Vec<_>>();
+    open.sort_unstable_by_key(|(id, _)| **id);
+
+    open.into_iter()
+        .filter_map(|(id, toplevel)| {
+            let address =
+                unique_hyprland_address(windows, &used, &toplevel.title, &toplevel.app_id)?;
+            used.insert(address);
+            Some((*id, address))
+        })
+        .collect()
+}
+
+fn hyprland_refresh_delay(
+    is_hyprland: bool,
+    toplevels: &HashMap<u32, Toplevel>,
+    correlations: &HashMap<u32, u64>,
+) -> Option<std::time::Duration> {
+    let open_count = toplevels
+        .values()
+        .filter(|toplevel| !toplevel.closed)
+        .count();
+    (is_hyprland && correlations.len() < open_count).then_some(std::time::Duration::from_millis(80))
+}
+
 fn foreign_toplevel_state_is_activated(state: &[u8]) -> bool {
     state
         .chunks_exact(std::mem::size_of::<u32>())
@@ -633,7 +698,24 @@ pub fn list_windows() -> anyhow::Result<Vec<WindowInfo>> {
     }
 
     let mut hyprland_windows = hyprland::list_windows().unwrap_or_default();
-    let mut used_hyprland_addresses = HashSet::new();
+    let mut hyprland_correlations =
+        correlate_hyprland_toplevels(&state.toplevels, &hyprland_windows);
+    // A foreign-toplevel event can arrive a few milliseconds before the same
+    // just-mapped client appears in Hyprland IPC. Accommodate that race with
+    // one shared refresh for the whole enumeration, not a sleep + four IPC
+    // refreshes for every unmatched or ambiguous toplevel.
+    if let Some(delay) = hyprland_refresh_delay(
+        hyprland::is_session(),
+        &state.toplevels,
+        &hyprland_correlations,
+    ) {
+        std::thread::sleep(delay);
+        if let Ok(refreshed) = hyprland::list_windows() {
+            hyprland_windows = refreshed;
+            hyprland_correlations =
+                correlate_hyprland_toplevels(&state.toplevels, &hyprland_windows);
+        }
+    }
     let sway_windows = sway_ipc::list_windows().unwrap_or_default();
     let mut used_sway_ids = HashSet::new();
     let mut out = Vec::new();
@@ -646,39 +728,12 @@ pub fn list_windows() -> anyhow::Result<Vec<WindowInfo>> {
         } else {
             format!("{} [{}]", tl.title, tl.app_id)
         };
-        let mut hyprland_address = unique_hyprland_address(
-            &hyprland_windows,
-            &used_hyprland_addresses,
-            &tl.title,
-            &tl.app_id,
-        );
-        // A foreign-toplevel event can arrive a few milliseconds before the
-        // same just-mapped client appears in Hyprland IPC. Never expose the
-        // connection-scoped protocol object as if it were a stable window id;
-        // briefly retry the compositor-owned identity correlation instead.
-        if hyprland_address.is_none() && hyprland::is_session() {
-            for _ in 0..4 {
-                std::thread::sleep(std::time::Duration::from_millis(20));
-                hyprland_windows = hyprland::list_windows().unwrap_or_default();
-                hyprland_address = unique_hyprland_address(
-                    &hyprland_windows,
-                    &used_hyprland_addresses,
-                    &tl.title,
-                    &tl.app_id,
-                );
-                if hyprland_address.is_some() {
-                    break;
-                }
-            }
-        }
+        let hyprland_address = hyprland_correlations.get(id).copied();
         let hyprland = hyprland_address.and_then(|address| {
             hyprland_windows
                 .iter()
                 .find(|window| window.address == address)
         });
-        if let Some(window) = hyprland {
-            used_hyprland_addresses.insert(window.address);
-        }
 
         let sway = hyprland
             .is_none()
@@ -996,7 +1051,7 @@ impl std::fmt::Display for SurfaceIdentityUnproven {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             formatter,
-            "surface_identity_unproven: cannot prove pixels belong to Wayland window {}: {}",
+            "surface_identity_unproven: Wayland capture cannot prove pixels belong to window {}: {}",
             self.window_id, self.reason
         )
     }
@@ -1008,65 +1063,99 @@ pub fn is_surface_identity_unproven(error: &anyhow::Error) -> bool {
     error.downcast_ref::<SurfaceIdentityUnproven>().is_some()
 }
 
-#[cfg(test)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct WaylandWindowCrop {
+    x: i32,
+    y: i32,
+    width: u32,
+    height: u32,
+}
+
+fn surface_identity_unproven(window_id: u64, reason: impl Into<String>) -> anyhow::Error {
+    SurfaceIdentityUnproven::new(window_id, reason).into()
+}
+
+fn attested_wayland_crop(
+    xid: u64,
+    x: i32,
+    y: i32,
+    width: u32,
+    height: u32,
+    visible: bool,
+) -> anyhow::Result<WaylandWindowCrop> {
+    if !visible {
+        return Err(surface_identity_unproven(
+            xid,
+            "the compositor reports the surface is not visible on the active workspace",
+        ));
+    }
+    if width == 0 || height == 0 {
+        return Err(surface_identity_unproven(
+            xid,
+            "the compositor reports empty surface geometry",
+        ));
+    }
+    Ok(WaylandWindowCrop {
+        x,
+        y,
+        width,
+        height,
+    })
+}
+
+/// Resolve a crop only from compositor-owned metadata that also proves the
+/// surface is present on the currently rendered workspace. X11 geometry and
+/// AT-SPI bounds are intentionally insufficient: an off-workspace XWayland
+/// window retains both while the output contains another application's pixels.
+fn wayland_window_crop(xid: u64) -> anyhow::Result<WaylandWindowCrop> {
+    if let Some(window) = sway_ipc::window_for_id(xid) {
+        return attested_wayland_crop(
+            xid,
+            window.x,
+            window.y,
+            window.width,
+            window.height,
+            window.visible,
+        );
+    }
+    if let Some(window) = shell_helper::list_windows(None)
+        .and_then(|windows| windows.into_iter().find(|window| window.xid == xid))
+    {
+        return attested_wayland_crop(
+            xid,
+            window.x,
+            window.y,
+            window.width,
+            window.height,
+            window.is_on_screen,
+        );
+    }
+    Err(surface_identity_unproven(
+        xid,
+        "no compositor-attested window geometry is available",
+    ))
+}
+
 fn screenshot_window_bytes_with_dispatch(
     wayland: bool,
     xid: u64,
+    wayland_crop: impl FnOnce(u64) -> anyhow::Result<WaylandWindowCrop>,
+    display_capture: impl FnOnce() -> anyhow::Result<Vec<u8>>,
     x11_capture: impl FnOnce(u64) -> anyhow::Result<Vec<u8>>,
 ) -> anyhow::Result<Vec<u8>> {
     if wayland {
-        return Err(SurfaceIdentityUnproven::new(
-            xid,
-            "per-window compositor capture is unavailable",
-        )
-        .into());
-    }
-    x11_capture(xid)
-}
-
-fn crop_png_to_rect(
-    output_png: &[u8],
-    rect_x: i32,
-    rect_y: i32,
-    rect_width: u32,
-    rect_height: u32,
-    label: &str,
-) -> anyhow::Result<Vec<u8>> {
-    let image = image::load_from_memory(output_png)?;
-    let image_width = image.width();
-    let image_height = image.height();
-    let x = rect_x.max(0) as u32;
-    let y = rect_y.max(0) as u32;
-    if x >= image_width || y >= image_height {
-        anyhow::bail!(
-            "{label} origin ({x},{y}) is outside captured output {image_width}x{image_height}"
+        let crop = wayland_crop(xid)?;
+        let output = display_capture()?;
+        return crop_png_to_rect(
+            &output,
+            crop.x,
+            crop.y,
+            crop.width,
+            crop.height,
+            &format!("Wayland window {xid}"),
         );
     }
-    let width = rect_width.min(image_width - x);
-    let height = rect_height.min(image_height - y);
-    if width == 0 || height == 0 {
-        anyhow::bail!("{label} has empty capture geometry");
-    }
-    let cropped = image.crop_imm(x, y, width, height);
-    let mut cursor = std::io::Cursor::new(Vec::new());
-    cropped.write_to(&mut cursor, image::ImageFormat::Png)?;
-    Ok(cursor.into_inner())
-}
-
-fn legacy_wayland_window_capture(xid: u64) -> anyhow::Result<Vec<u8>> {
-    let bytes = screenshot_display_dispatch()?;
-    if let Some((x, y, width, height)) = window_geometry(xid) {
-        crop_png_to_rect(
-            &bytes,
-            x,
-            y,
-            width,
-            height,
-            &format!("Wayland window {xid}"),
-        )
-    } else {
-        Ok(bytes)
-    }
+    x11_capture(xid)
 }
 
 fn capture_hyprland_toplevel_bounded(address: u64) -> anyhow::Result<Vec<u8>> {
@@ -1102,9 +1191,15 @@ fn screenshot_dispatch_for_target(xid: u64, target_pid: Option<u32>) -> anyhow::
         });
     }
 
-    // Preserve the accepted Sway/GNOME/KDE behavior in this focused Hyprland
-    // fix. Their capture contracts require separate compositor-specific work.
-    legacy_wayland_window_capture(xid)
+    // Keep v0.22's shared contract for every other compositor: output pixels
+    // are cropped only from compositor-attested, currently visible geometry.
+    screenshot_window_bytes_with_dispatch(
+        true,
+        xid,
+        wayland_window_crop,
+        screenshot_display_dispatch,
+        crate::capture::screenshot_window_bytes,
+    )
 }
 
 /// Window capture dispatcher for callers that do not carry process identity.
@@ -1115,6 +1210,35 @@ pub fn screenshot_dispatch(xid: u64) -> anyhow::Result<Vec<u8>> {
 /// Window capture dispatcher with the PID proven by the public tool target.
 pub fn screenshot_dispatch_with_pid(xid: u64, pid: u32) -> anyhow::Result<Vec<u8>> {
     screenshot_dispatch_for_target(xid, Some(pid))
+}
+
+fn crop_png_to_rect(
+    output_png: &[u8],
+    rect_x: i32,
+    rect_y: i32,
+    rect_width: u32,
+    rect_height: u32,
+    label: &str,
+) -> anyhow::Result<Vec<u8>> {
+    let image = image::load_from_memory(output_png)?;
+    let image_width = image.width();
+    let image_height = image.height();
+    let x = rect_x.max(0) as u32;
+    let y = rect_y.max(0) as u32;
+    if x >= image_width || y >= image_height {
+        anyhow::bail!(
+            "{label} origin ({x},{y}) is outside captured output {image_width}x{image_height}"
+        );
+    }
+    let width = rect_width.min(image_width - x);
+    let height = rect_height.min(image_height - y);
+    if width == 0 || height == 0 {
+        anyhow::bail!("{label} has empty capture geometry");
+    }
+    let cropped = image.crop_imm(x, y, width, height);
+    let mut cursor = std::io::Cursor::new(Vec::new());
+    cropped.write_to(&mut cursor, image::ImageFormat::Png)?;
+    Ok(cursor.into_inner())
 }
 
 /// Display-level capture dispatcher. Cascade:
@@ -1468,6 +1592,9 @@ pub fn with_target_foreground<T>(
     window_id: u64,
     body: impl FnOnce() -> anyhow::Result<T>,
 ) -> anyhow::Result<T> {
+    if hyprland::is_session() {
+        return hyprland::with_focused_window(pid, window_id, body);
+    }
     if let Some(window) = sway_ipc::window_for_id(window_id) {
         if window.pid != pid {
             anyhow::bail!(
@@ -3183,26 +3310,26 @@ pub fn list_windows_dispatch(filter_pid: Option<u32>) -> Vec<WindowInfo> {
             Ok(ws) if !ws.is_empty() => {
                 if let Some(pid) = filter_pid {
                     if let Some(filtered) = native_windows_for_pid(ws, pid) {
-                        return filtered;
+                        return listed_windows(filtered);
                     }
                 } else {
-                    return ws;
+                    return listed_windows(ws);
                 }
                 // A compositor window without pid metadata cannot satisfy a
                 // pid-scoped request. Continue to the AT-SPI registry.
                 let ws = wayland_atspi_windows(filter_pid);
                 if !ws.is_empty() {
-                    return ws;
+                    return listed_windows(ws);
                 }
             }
             Ok(_) => {
                 if let Some(ws) = shell_helper::list_windows(filter_pid).filter(|ws| !ws.is_empty())
                 {
-                    return ws;
+                    return listed_windows(ws);
                 }
                 let ws = wayland_atspi_windows(filter_pid);
                 if !ws.is_empty() {
-                    return ws;
+                    return listed_windows(ws);
                 }
             }
             Err(e) => {
@@ -3211,12 +3338,12 @@ pub fn list_windows_dispatch(filter_pid: Option<u32>) -> Vec<WindowInfo> {
                     tracing::debug!(
                         "native Wayland protocols unavailable ({e}); using compositor helper"
                     );
-                    return ws;
+                    return listed_windows(ws);
                 }
                 tracing::warn!("native Wayland list_windows failed: {e}; trying AT-SPI registry");
                 let ws = wayland_atspi_windows(filter_pid);
                 if !ws.is_empty() {
-                    return ws;
+                    return listed_windows(ws);
                 }
             }
         }
@@ -3244,7 +3371,7 @@ pub fn list_windows_dispatch(filter_pid: Option<u32>) -> Vec<WindowInfo> {
             merge_atspi_windows(&mut ws, &seen, wayland_atspi_windows(filter_pid));
         }
     }
-    ws
+    listed_windows(ws)
 }
 
 fn merge_atspi_windows(
@@ -3456,6 +3583,81 @@ mod tests {
         }
     }
 
+    fn toplevel(title: &str, app_id: &str) -> Toplevel {
+        Toplevel {
+            title: title.to_owned(),
+            app_id: app_id.to_owned(),
+            ..Toplevel::default()
+        }
+    }
+
+    fn hypr_window(address: u64, title: &str, app_id: &str) -> hyprland::Window {
+        hyprland::Window {
+            address,
+            pid: 42,
+            title: title.to_owned(),
+            app_id: app_id.to_owned(),
+            x: 0,
+            y: 0,
+            width: 800,
+            height: 600,
+            workspace: 1,
+            visible: true,
+        }
+    }
+
+    #[test]
+    fn hyprland_retry_plan_is_one_shared_refresh_for_any_unmatched_toplevel() {
+        let toplevels = HashMap::from([
+            (1, toplevel("Ready", "ready.app")),
+            (2, toplevel("Just mapped", "new.app")),
+        ]);
+        let windows = [hypr_window(0x1111, "Ready", "ready.app")];
+        let correlations = correlate_hyprland_toplevels(&toplevels, &windows);
+
+        assert_eq!(correlations, HashMap::from([(1, 0x1111)]));
+        assert_eq!(
+            hyprland_refresh_delay(true, &toplevels, &correlations),
+            Some(std::time::Duration::from_millis(80))
+        );
+        assert_eq!(
+            hyprland_refresh_delay(false, &toplevels, &correlations),
+            None
+        );
+    }
+
+    #[test]
+    fn hyprland_correlation_remains_fail_closed_when_identity_is_ambiguous() {
+        let toplevels = HashMap::from([(1, toplevel("Shared", "shared.app"))]);
+        let windows = [
+            hypr_window(0x1111, "Shared", "shared.app"),
+            hypr_window(0x2222, "Shared", "shared.app"),
+        ];
+        let correlations = correlate_hyprland_toplevels(&toplevels, &windows);
+
+        assert!(correlations.is_empty());
+        assert!(hyprland_refresh_delay(true, &toplevels, &correlations).is_some());
+    }
+
+    #[test]
+    fn fully_correlated_hyprland_enumeration_skips_refresh() {
+        let toplevels = HashMap::from([
+            (1, toplevel("First", "first.app")),
+            (2, toplevel("Second", "second.app")),
+        ]);
+        let windows = [
+            hypr_window(0x1111, "First", "first.app"),
+            hypr_window(0x2222, "Second", "second.app"),
+        ];
+        let correlations = correlate_hyprland_toplevels(&toplevels, &windows);
+
+        assert_eq!(correlations.len(), 2);
+        assert_eq!(
+            hyprland_refresh_delay(true, &toplevels, &correlations),
+            None
+        );
+    }
+
     #[test]
     fn atspi_merge_keeps_x11_geometry_owner_and_native_only_frames() {
         let mut windows = vec![window(10, Some(100), "XWayland")];
@@ -3587,29 +3789,105 @@ mod tests {
 
     #[test]
     fn wayland_window_capture_fails_closed_without_using_x11_pixels() {
+        let display_called = std::cell::Cell::new(false);
         let x11_called = std::cell::Cell::new(false);
-        let error = screenshot_window_bytes_with_dispatch(true, 0x2962, |_| {
-            x11_called.set(true);
-            Ok(vec![1, 2, 3])
-        })
+        let error = screenshot_window_bytes_with_dispatch(
+            true,
+            0x2962,
+            |xid| {
+                Err(surface_identity_unproven(
+                    xid,
+                    "fixture surface is off-workspace",
+                ))
+            },
+            || {
+                display_called.set(true);
+                Ok(vec![9, 9, 9])
+            },
+            |_| {
+                x11_called.set(true);
+                Ok(vec![1, 2, 3])
+            },
+        )
         .expect_err("Wayland output pixels cannot prove a window surface");
 
         assert!(is_surface_identity_unproven(&error));
         assert!(error.to_string().contains("window 10594"));
+        assert!(!display_called.get());
         assert!(!x11_called.get());
     }
 
     #[test]
     fn x11_window_capture_keeps_the_existing_per_window_path() {
         let captured_xid = std::cell::Cell::new(None);
-        let bytes = screenshot_window_bytes_with_dispatch(false, 42, |xid| {
-            captured_xid.set(Some(xid));
-            Ok(vec![1, 2, 3])
-        })
+        let bytes = screenshot_window_bytes_with_dispatch(
+            false,
+            42,
+            |_| panic!("X11 must not resolve a Wayland crop"),
+            || panic!("X11 must not capture the Wayland output"),
+            |xid| {
+                captured_xid.set(Some(xid));
+                Ok(vec![1, 2, 3])
+            },
+        )
         .expect("X11 per-window capture should remain available");
 
         assert_eq!(captured_xid.get(), Some(42));
         assert_eq!(bytes, vec![1, 2, 3]);
+    }
+
+    #[test]
+    fn listed_wayland_identity_remains_valid_when_current_enumeration_hides_it() {
+        let pid = std::process::id();
+        let window_id = 0xf2962_0001;
+        assert!(!window_was_listed_for_pid(pid, window_id));
+
+        remember_listed_windows(&[WindowInfo {
+            xid: window_id,
+            pid: Some(pid),
+            app_name: String::new(),
+            title: String::new(),
+            is_on_screen: false,
+            z_index: None,
+            x: 0,
+            y: 0,
+            width: 0,
+            height: 0,
+        }]);
+
+        assert!(window_was_listed_for_pid(pid, window_id));
+        assert!(!window_was_listed_for_pid(pid + 1, window_id));
+        assert!(!window_was_listed_for_pid(pid, window_id + 1));
+    }
+
+    #[test]
+    fn compositor_attested_visible_wayland_surface_keeps_window_capture() {
+        let source = image::DynamicImage::ImageRgba8(image::RgbaImage::from_pixel(
+            8,
+            6,
+            image::Rgba([20, 40, 60, 255]),
+        ));
+        let mut encoded = std::io::Cursor::new(Vec::new());
+        source
+            .write_to(&mut encoded, image::ImageFormat::Png)
+            .expect("encode fixture PNG");
+        let cropped = screenshot_window_bytes_with_dispatch(
+            true,
+            42,
+            |_| {
+                Ok(WaylandWindowCrop {
+                    x: 2,
+                    y: 1,
+                    width: 3,
+                    height: 4,
+                })
+            },
+            || Ok(encoded.into_inner()),
+            |_| panic!("Wayland must not use the X11 capture path"),
+        )
+        .expect("visible compositor-attested Wayland surface should capture");
+        let decoded = image::load_from_memory(&cropped).expect("decode cropped PNG");
+        assert_eq!((decoded.width(), decoded.height()), (3, 4));
     }
 
     #[test]

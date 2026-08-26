@@ -7,6 +7,10 @@ import { Callout } from 'fumadocs-ui/components/callout';
 
 Cua Driver lets a [computer-use agent](/concepts/what-is-computer-use) drive the **host desktop**: installed apps, signed-in browser sessions, local files opened in apps, and the current OS user session. MCP-capable agents connect through `cua-driver mcp`; skill-based agents such as Prime Agent call the CLI directly. [Grok Bot](/use-cua-with/grok-bot) is a separate path; it is not Grok Build and does not use stdio MCP.
 
+Building Cua Driver into an application instead? Start with [Choose a Cua
+Driver integration](/concepts/choose-a-cua-driver-integration) to compare MCP,
+the direct SDK, private workers, and app-hosted services.
+
 <Callout type="info">
   This connects an agent to Cua Driver on the current machine. To create a disposable local desktop,
   use [Cua Sandbox](/tutorials/your-first-local-sandbox) instead.
@@ -175,7 +179,6 @@ Restart Cursor and confirm `cua-driver` appears in the MCP server list.
 | Antigravity   | `cua-driver mcp-config --client antigravity` | Paste into `~/.gemini/config/mcp_config.json`; `--client gemini` is a legacy alias.                                                                         |
 | OpenClaw      | `cua-driver mcp-config --client openclaw`    | Normal gateway-spawned MCP does not inherit OpenClaw.app's macOS permission grants; embedded hosts should use [Embedding](/reference/cua-driver/embedding). |
 | OpenCode      | `cua-driver mcp-config --client opencode`    | Configure a real MCP server so screenshots are preserved in image blocks.                                                                                   |
-| Hermes        | `cua-driver mcp-config --client hermes`      | Paste under `mcp_servers` and reload MCP servers in Hermes.                                                                                                 |
 | Pi            | `cua-driver mcp-config --client pi`          | Pi does not support MCP natively; use one-shot `cua-driver call …` commands from its shell.                                                                 |
 | Qwen Code     | `cua-driver mcp-config --client qwen`        | Supports both a CLI add command and `~/.qwen/settings.json`.                                                                                                |
 | Factory Droid | `cua-driver mcp-config --client droid`       | Supports CLI and JSON config forms.                                                                                                                         |

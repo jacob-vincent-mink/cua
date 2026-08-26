@@ -43,7 +43,7 @@ import (
 //     error, the three values the plan can produce.
 //   - Anything downstream of the policy. An "allow" in this table means "the
 //     policy stage let it through", never "the request succeeds". It used to
-//     mean considerably less than that on /api/svc, /api/orch and GET
+//     mean considerably less than that on /api/svc and GET
 //     /api/namespaces/{name}, where the namespace-ownership boundary was a Go
 //     check in the handler and invisible here; those routes now carry it as a
 //     policy conjunct, and this table records it.
@@ -159,6 +159,7 @@ func characterizationCases() map[string][]routeCase {
 	}
 	simple("/api/config", "/api/config")
 	simple("/api/state/query", "/api/state/query")
+	simple("/api/chat/conversations", "/api/chat/conversations")
 	simple("/api/billing/summary", "/api/billing/summary")
 	simple("/api/billing/setup-session", "/api/billing/setup-session")
 	simple("/api/billing/portal-session", "/api/billing/portal-session")
@@ -175,8 +176,14 @@ func characterizationCases() map[string][]routeCase {
 		}}
 	}
 	withID("/api/keys/{id}", "/api/keys")
+	withID("/api/chat/conversations/{id}", "/api/chat/conversations")
 	withID("/api/user-keys/{id}", "/api/user-keys")
 	withID("/api/github-trust-policies/{id}", "/api/github-trust-policies")
+	cases["/api/chat/conversations/{id}/turns"] = []routeCase{{
+		name:   "id",
+		params: map[string]string{"id": "id-1"},
+		path:   "/api/chat/conversations/id-1/turns",
+	}}
 
 	// /api/namespaces/{name} needs all three fact answers, and only on GET: the
 	// ownership conjunct binds to that one method, and DELETE sharing the route
@@ -200,7 +207,7 @@ func characterizationCases() map[string][]routeCase {
 		},
 	}
 
-	// /api/svc and /api/orch gate on the DNS-label shape of their parameters,
+	// /api/svc gates on the DNS-label shape of its parameters,
 	// on the namespace claim matching the path for per-key and GitHub tokens,
 	// and on the RBAC fact for everyone else. owned-ns / other-ns / unreachable-ns
 	// are the three answers the fact provider gives.
@@ -227,20 +234,6 @@ func characterizationCases() map[string][]routeCase {
 	}
 	cases["/api/svc/{namespace}/{service}"] = proxyCases(false)
 	cases["/api/svc/{namespace}/{service}/{path...}"] = proxyCases(true)
-
-	orchCase := func(name, namespace string) routeCase {
-		return routeCase{
-			name:   name,
-			params: map[string]string{"namespace": namespace, "service": "svc-a", "path": "catalog"},
-			path:   "/api/orch/" + namespace + "/svc-a/catalog",
-		}
-	}
-	cases["/api/orch/{namespace}/{service}/{path...}"] = []routeCase{
-		orchCase("owned-ns", characterizationOwnedNamespace),
-		orchCase("other-ns", characterizationUnownedNamespace),
-		orchCase("unreachable-ns", characterizationUnreachableNamespace),
-		orchCase("invalid-ns", "Not_A_Label"),
-	}
 
 	// /api/k8s carries the richest parameter logic in the policy: the infra-path
 	// list, the admin escape hatch over it, the GitHub namespace grant, and the

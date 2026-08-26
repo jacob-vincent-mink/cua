@@ -2256,7 +2256,6 @@ mod tests {
             br#"{
                 "tool":"browser_prepare",
                 "arguments":{
-                    "approval_token":"[redacted]",
                     "pid":1,
                     "window_id":2,
                     "strategy":{"kind":"existing_profile"}

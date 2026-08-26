@@ -13,6 +13,10 @@ Linux.
 
 New to agents that operate applications? Start with [What is computer use?](/concepts/what-is-computer-use) for the model behind the workflow, then return here to build one.
 
+This tutorial connects an existing agent to Cua Driver. If you are embedding
+Cua Driver in a product, start with [Choose a Cua Driver
+integration](/concepts/choose-a-cua-driver-integration) instead.
+
 <VideoDemo
   src="https://github.com/user-attachments/assets/11b248e5-d505-4349-aaae-ad9f95a1162f"
   poster="https://github.com/user-attachments/assets/0fb62243-56ec-4d51-8771-35640a5e6031"
@@ -188,25 +192,19 @@ Register Cua Driver with your agent harness once.
     </Callout>
   </Tab>
   <Tab value="Hermes">
-    Print the Hermes snippet:
+    Hermes includes a built-in `computer_use` toolset. Verify it and the
+    available Cua Driver instead of adding a second raw MCP server:
 
     ```bash
-    cua-driver mcp-config --client hermes
+    hermes computer-use status
+    hermes computer-use doctor
+    hermes tools list
     ```
 
-    Paste it under mcp_servers in ~/.hermes/config.yaml:
+    If `computer_use` is disabled, enable it for the CLI:
 
-    ```yaml
-    mcp_servers:
-      cua-driver:
-        command: "cua-driver"
-        args: ["mcp"]
-    ```
-
-    Then reload MCP servers inside Hermes:
-
-    ```text
-    /reload-mcp
+    ```bash
+    hermes tools enable computer_use --platform cli
     ```
   </Tab>
 </Tabs>

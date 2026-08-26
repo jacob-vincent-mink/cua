@@ -110,13 +110,7 @@ fn with_target_foreground<T>(
     body: impl FnOnce() -> anyhow::Result<T>,
 ) -> anyhow::Result<T> {
     if std::env::var_os("WAYLAND_DISPLAY").is_some() {
-        if let Some(window) =
-            crate::wayland::sway_ipc::window_for_id(window_id).filter(|window| window.pid == pid)
-        {
-            crate::wayland::sway_ipc::with_focused_container(window.id, body)
-        } else {
-            crate::wayland::shell_helper::with_focused_window(pid, window_id, body)
-        }
+        crate::wayland::with_target_foreground(pid, window_id, body)
     } else {
         crate::input::with_x11_foreground(window_id, 80, body)
     }
@@ -125,7 +119,7 @@ fn with_target_foreground<T>(
 fn close_tab(pid: u32, window_id: u64) -> anyhow::Result<()> {
     with_target_foreground(pid, window_id, || {
         if std::env::var_os("WAYLAND_DISPLAY").is_some() {
-            crate::wayland::hotkey(window_id, &["ctrl".to_owned(), "w".to_owned()])
+            crate::wayland::hotkey_focused(&["ctrl".to_owned(), "w".to_owned()])
         } else {
             crate::input::send_key_xtest("w", &["ctrl"])
         }

@@ -12,6 +12,7 @@ import (
 	"sync"
 	"time"
 
+	"cyclops-cs-backend/metrics"
 	"cyclops-cs-backend/middlewares"
 
 	"github.com/open-feature/go-sdk/openfeature"
@@ -24,7 +25,10 @@ type ctxKey int
 
 const UserKey ctxKey = 1
 
-var opaAdminQuery *rego.PreparedEvalQuery
+var (
+	opaAdminQuery *rego.PreparedEvalQuery
+	opaChatQuery  *rego.PreparedEvalQuery
+)
 
 // authzPolicy is the shared principal vocabulary every surface module imports.
 // It holds no allow rule of its own; see authz.rego.
@@ -34,6 +38,9 @@ var authzPolicy string
 
 //go:embed pool_admission.rego
 var poolAdmissionPolicy string
+
+//go:embed custom_resource_creation_admission.rego
+var customResourceCreationAdmissionPolicy string
 
 // authzOwnershipPolicy is the namespace-ownership boundary. Like
 // pool_admission.rego it is not a surface — it is a conjunct several surfaces
@@ -56,12 +63,12 @@ var surfacePolicySources = map[string]struct {
 	"authz-base":         {"authz_base.rego", authzBasePolicy},
 	"authz-keys":         {"authz_keys.rego", authzKeysPolicy},
 	"authz-config":       {"authz_config.rego", authzConfigPolicy},
+	"authz-chat":         {"authz_chat.rego", authzChatPolicy},
 	"authz-billing":      {"authz_billing.rego", authzBillingPolicy},
 	"authz-namespaces":   {"authz_namespaces.rego", authzNamespacesPolicy},
 	"authz-github-trust": {"authz_github_trust.rego", authzGitHubTrustPolicy},
 	"authz-user-keys":    {"authz_user_keys.rego", authzUserKeysPolicy},
 	"authz-k8s":          {"authz_k8s.rego", authzK8sPolicy},
-	"authz-orch":         {"authz_orch.rego", authzOrchPolicy},
 	"authz-svc":          {"authz_svc.rego", authzSvcPolicy},
 	"authz-state-query":  {"authz_state_query.rego", authzStateQueryPolicy},
 }
@@ -74,6 +81,9 @@ var authzKeysPolicy string
 
 //go:embed authz_config.rego
 var authzConfigPolicy string
+
+//go:embed authz_chat.rego
+var authzChatPolicy string
 
 //go:embed authz_billing.rego
 var authzBillingPolicy string
@@ -90,9 +100,6 @@ var authzUserKeysPolicy string
 //go:embed authz_k8s.rego
 var authzK8sPolicy string
 
-//go:embed authz_orch.rego
-var authzOrchPolicy string
-
 //go:embed authz_svc.rego
 var authzSvcPolicy string
 
@@ -108,7 +115,10 @@ var authzStateQueryPolicy string
 //	/feature-flags/cyclops-cs/admin-subs → CYCLOPS_CS_ADMIN_SUBS
 //
 // Values are JSON string arrays (e.g. '["sub1","sub2"]').
-const flagPrefix = "/feature-flags/cyclops-cs/"
+const (
+	flagPrefix        = "/feature-flags/cyclops-cs/"
+	cardAdmissionFlag = flagPrefix + "require-card-for-custom-resource-creation"
+)
 
 // flagsTTL bounds how long flagsData returns its last computed result
 // before re-resolving via OpenFeature. Refresh is lazy and ad-hoc: the
@@ -191,12 +201,29 @@ func computeFlagsData(ctx context.Context) map[string]interface{} {
 	}
 	flags := map[string]interface{}{}
 	for _, key := range keys {
+		if key == cardAdmissionFlag {
+			continue
+		}
 		name := opaNameFromFlagKey(key)
 		if name == "" {
 			continue
 		}
-		flags[name] = loadStringList(ctx, ffClient, key)
+		items, err := loadStringList(ctx, ffClient, key)
+		if err != nil {
+			slog.Warn("auth: flag load failed; flags will be empty", "flag", key, "err", err)
+			return map[string]interface{}{}
+		}
+		flags[name] = items
 	}
+	callCtx, cancel := context.WithTimeout(ctx, 3*time.Second)
+	defer cancel()
+	enabled, err := ffClient.BooleanValue(
+		callCtx, cardAdmissionFlag, false, openfeature.EvaluationContext{},
+	)
+	if err != nil {
+		slog.Warn("auth: flag eval failed; using false", "flag", cardAdmissionFlag, "err", err)
+	}
+	flags["require_card_for_custom_resource_creation"] = enabled
 	return flags
 }
 
@@ -214,30 +241,27 @@ func opaNameFromFlagKey(key string) string {
 }
 
 // loadStringList resolves a JSON-array flag to []interface{} for OPA's
-// input.flags document. The value is StringValue with default "[]"; a
-// malformed payload yields an empty list and a warn log so OPA still
-// evaluates.
+// input.flags document. Evaluation and decoding failures are returned so
+// computeFlagsData can discard the entire authorization flag set.
 //
 // A 3s per-call deadline keeps an unreachable Parameter Store from
 // stalling pod startup; the from-env fallback kicks in on timeout.
-func loadStringList(ctx context.Context, client *openfeature.Client, flagKey string) []interface{} {
+func loadStringList(ctx context.Context, client *openfeature.Client, flagKey string) ([]interface{}, error) {
 	callCtx, cancel := context.WithTimeout(ctx, 3*time.Second)
 	defer cancel()
 	raw, err := client.StringValue(callCtx, flagKey, "[]", openfeature.EvaluationContext{})
 	if err != nil {
-		slog.Warn("auth: flag eval failed; using empty list", "flag", flagKey, "err", err)
-		return []interface{}{}
+		return nil, fmt.Errorf("evaluate %s as string list: %w", flagKey, err)
 	}
 	var items []string
 	if err := json.Unmarshal([]byte(raw), &items); err != nil {
-		slog.Warn("auth: flag value is not a JSON string array; using empty list", "flag", flagKey, "err", err)
-		return []interface{}{}
+		return nil, fmt.Errorf("decode %s as JSON string array: %w", flagKey, err)
 	}
 	out := make([]interface{}, len(items))
 	for i, v := range items {
 		out[i] = v
 	}
-	return out
+	return out, nil
 }
 
 // LoadOpa prepares the embedded Rego policy and all derived queries.
@@ -248,6 +272,7 @@ func loadStringList(ctx context.Context, client *openfeature.Client, flagKey str
 func LoadOpa() {
 	RegisterPolicyModule("authz", "authz.rego", authzPolicy)
 	RegisterPolicyModule("pool-admission", "pool_admission.rego", poolAdmissionPolicy)
+	RegisterPolicyModule("custom-resource-creation-admission", "custom_resource_creation_admission.rego", customResourceCreationAdmissionPolicy)
 	RegisterPolicyModule("authz-ownership", "authz_ownership.rego", authzOwnershipPolicy)
 	for name, module := range surfacePolicySources {
 		RegisterPolicyModule(name, module.filename, module.source)
@@ -270,6 +295,7 @@ func LoadOpa() {
 	}
 
 	opaAdminQuery = prepareAuthzQuery("data.authz.is_admin")
+	opaChatQuery = prepareAuthzQuery("data.authz.chat_enabled")
 
 	// Warm the flag cache once so the first request isn't slowed by the
 	// initial resolve and any SSM/provider misconfiguration surfaces in the
@@ -281,6 +307,16 @@ func LoadOpa() {
 // (data.authz.is_admin). is_admin only reads input.user and input.flags, so
 // no route/method/path is needed.
 func EvalIsAdmin(ctx context.Context, user *User) (bool, error) {
+	return evalUserDecision(ctx, user, opaAdminQuery)
+}
+
+// EvalChatEnabled returns the restricted-mode chat decision: administrators
+// and users listed in input.flags.chat_subs are enabled.
+func EvalChatEnabled(ctx context.Context, user *User) (bool, error) {
+	return evalUserDecision(ctx, user, opaChatQuery)
+}
+
+func evalUserDecision(ctx context.Context, user *User, query *rego.PreparedEvalQuery) (bool, error) {
 	if user == nil {
 		return false, nil
 	}
@@ -288,7 +324,7 @@ func EvalIsAdmin(ctx context.Context, user *User) (bool, error) {
 		"user":  buildUserInput(user),
 		"flags": flagsData(),
 	}
-	res, err := opaAdminQuery.Eval(ctx, rego.EvalInput(input))
+	res, err := query.Eval(ctx, rego.EvalInput(input))
 	if err != nil {
 		return false, err
 	}
@@ -346,6 +382,7 @@ func TokenAuthMiddleware(next http.Handler) http.Handler {
 					Email: proxyEmail,
 					AZP:   "oauth2-proxy", // distinct from SPA/key clients for OPA
 				}
+				metrics.SetRequestUser(r.Context(), user.ID)
 				next.ServeHTTP(w, r.WithContext(context.WithValue(r.Context(), UserKey, user)))
 				return
 			}
@@ -358,6 +395,10 @@ func TokenAuthMiddleware(next http.Handler) http.Handler {
 		user, err := validateWithContext(r.Context(), raw)
 		if err != nil {
 			result = err.Error()
+			if IsDatabaseUnavailable(err) {
+				writeJSONErr(w, http.StatusServiceUnavailable, "authentication unavailable")
+				return
+			}
 			writeJSONErr(w, http.StatusUnauthorized, "auth token is invalid")
 			return
 		}
@@ -377,6 +418,7 @@ func TokenAuthMiddleware(next http.Handler) http.Handler {
 			return
 		}
 
+		metrics.SetRequestUser(r.Context(), user.ID)
 		next.ServeHTTP(w, r.WithContext(context.WithValue(r.Context(), UserKey, user)))
 	})
 }

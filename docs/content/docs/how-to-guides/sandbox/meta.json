@@ -4,10 +4,12 @@
     "lifecycle",
     "configure-pool-with-terraform",
     "create-pool-with-python",
+    "expire-pools-and-claims",
     "secrets",
     "scale-out",
     "tunneling",
     "images",
-    "interactive-shell"
+    "interactive-shell",
+    "minecraft"
   ]
 }
